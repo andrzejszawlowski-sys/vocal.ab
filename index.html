@@ -1,0 +1,2819 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0d0c0b">
+<title>VocabLab</title>
+<link rel="manifest" href="manifest.json">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body { background: #0d0c0b; margin: 0; padding: 0; overscroll-behavior: none; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React from CDN -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<!-- Babel for JSX transform -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+// Make React hooks available globally (Babel standalone needs this)
+const { useState, useEffect, useRef, useCallback } = React;
+
+
+// ════════════════════════════════════════════════════════════
+//  CONSTANTS & THEME
+// ════════════════════════════════════════════════════════════
+const APP_VERSION = "1.2.0-synonyms";
+const STORAGE_KEY = "vl_data_v1";
+const GEMINI_KEY_STORAGE = "vl_gemini_key";
+
+const T = {
+  bg: "#0d0c0b", s1: "#151412", s2: "#1c1a18", s3: "#232120",
+  b1: "#2a2826", b2: "#353230", b3: "#424040",
+  acc: "#f5c842", acc2: "#42c9c0", acc3: "#f56042",
+  green: "#5ec97a", red: "#f05a5a", blue: "#5a8ff0", purple: "#a78bf0",
+  tx: "#ede8df", tx2: "#9c9790", tx3: "#5c5a56",
+  r: "10px", r2: "16px", r3: "22px",
+};
+
+// ════════════════════════════════════════════════════════════
+//  UTILS
+// ════════════════════════════════════════════════════════════
+const uid = () => Math.random().toString(36).slice(2, 10);
+const norm = s => (s || "").trim().toLowerCase().replace(/[''`]/g, "'").replace(/ą/g,"a").replace(/ć/g,"c").replace(/ę/g,"e").replace(/ł/g,"l").replace(/ń/g,"n").replace(/ó/g,"o").replace(/ś/g,"s").replace(/ź/g,"z").replace(/ż/g,"z");
+const normPL = s => (s || "").trim().toLowerCase().replace(/[''`]/g, "'");
+
+// Levenshtein distance
+function levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1] : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+  return dp[m][n];
+}
+
+// Polish verb form normalization — strips common suffixes to root
+function plRoot(s) {
+  const w = normPL(s);
+  // Strip personal endings to get infinitive-like root
+  return w
+    .replace(/(uję|ujesz|uje|ujemy|ujecie|ują)$/, "ować")
+    .replace(/(ię|isz|i|imy|icie|ią)$/, "ić")
+    .replace(/(ę|esz|e|emy|ecie|ą)$/, "ać")
+    .replace(/(am|asz|a|amy|acie|ają)$/, "ać")
+    .replace(/(ę|ysz|y|ymy|ycie|ą)$/, "yć")
+    .replace(/em$/, "eć")
+    .replace(/ę$/, "eć");
+}
+
+// Exact or fuzzy match — returns "full"|"typo"|"none"
+function localMatch(inp, correct) {
+  const i = normPL(inp.trim()); if (!i) return "none";
+  const alts = correct.split("/").map(a => normPL(a.trim()));
+  // 1. exact
+  if (alts.some(a => a === i)) return "full";
+  // 2. diacritic-stripped exact
+  if (alts.some(a => norm(a) === norm(i))) return "full";
+  // 3. verb form — compare roots
+  if (alts.some(a => plRoot(a) === plRoot(i))) return "partial";
+  // 4. Levenshtein ≤ 2 (typo tolerance)
+  const minDist = Math.min(...alts.map(a => levenshtein(norm(a), norm(i))));
+  if (minDist === 1) return "typo";
+  if (minDist === 2 && i.length > 5) return "typo";
+  return "none";
+}
+
+const matchAny = (inp, correct) => localMatch(inp, correct) !== "none";
+
+const shuffle = arr => { const a = [...arr]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+// ════════════════════════════════════════════════════════════
+//  AI EVALUATOR  (Gemini Flash 2.0)
+// ════════════════════════════════════════════════════════════
+// Per-user key stored as vl_gemini_key__userId, falls back to shared
+function getGeminiKey(userId) {
+  try {
+    if (userId) {
+      const personal = localStorage.getItem(`${GEMINI_KEY_STORAGE}__${userId}`);
+      if (personal) return personal;
+    }
+    return localStorage.getItem(GEMINI_KEY_STORAGE) || "";
+  } catch { return ""; }
+}
+function setGeminiKey(key, userId) {
+  try {
+    const k = (key || "").trim();
+    const storKey = userId ? `${GEMINI_KEY_STORAGE}__${userId}` : GEMINI_KEY_STORAGE;
+    if (k) localStorage.setItem(storKey, k);
+    else localStorage.removeItem(storKey);
+  } catch {}
+}
+
+// Returns { quality: "full"|"partial"|"wrong", feedback: string, suggestion: string, source: "ai"|"local" }
+async function evaluateAnswer({ wordEN, wordPL, userAnswer, forms, formsAnswer, userId }) {
+  const key = getGeminiKey(userId);
+
+  // ── LEVEL 1: local check first (instant, no API) ──────
+  const localResult = localMatch(userAnswer, wordPL);
+  let formsOk = true;
+  let formsDetail = "";
+
+  if (forms && formsAnswer) {
+    const pastResult = localMatch(formsAnswer.past || "", forms.past);
+    const ppResult   = localMatch(formsAnswer.pp   || "", forms.pp);
+    formsOk = pastResult !== "none" && ppResult !== "none";
+    if (!formsOk) {
+      formsDetail = `Past: ${formsAnswer.past || "—"} (poprawnie: ${forms.past}) · PP: ${formsAnswer.pp || "—"} (poprawnie: ${forms.pp})`;
+    }
+  }
+
+  // Perfect local match — no need for AI
+  if (localResult === "full" && formsOk) {
+    return { quality: "full", feedback: "Idealna odpowiedź!", suggestion: wordPL, source: "local" };
+  }
+
+  // Typo in main word but forms OK
+  if (localResult === "typo" && formsOk) {
+    return { quality: "partial", feedback: `Literówka — prawie dobrze!`, suggestion: wordPL, source: "local" };
+  }
+
+  // Partial (verb form match) — may still be OK, confirm with AI if key available
+  if (localResult === "partial" && formsOk && !key) {
+    return { quality: "partial", feedback: `Akceptowana forma. Wzorcowe tłumaczenie: ${wordPL}`, suggestion: wordPL, source: "local" };
+  }
+
+  // Clear mismatch without AI key — just show proper answer
+  if (!key) {
+    if (localResult === "none") {
+      return { quality: "wrong", feedback: `Błędna odpowiedź.`, suggestion: wordPL, source: "local",
+        correctDisplay: wordPL + (forms ? ` · ${forms.past} · ${forms.pp}` : "") };
+    }
+    return { quality: "partial", feedback: `Akceptowane, ale sprawdź: ${wordPL}`, suggestion: wordPL, source: "local" };
+  }
+
+  // ── LEVEL 2: Gemini AI evaluation ─────────────────────
+  try {
+    const formsPrompt = forms
+      ? `\nFormy czasownika (past/pp): "${forms.past}" / "${forms.pp}"\nOdpowiedź ucznia (past/pp): "${formsAnswer?.past || ""}" / "${formsAnswer?.pp || ""}"`
+      : "";
+
+    const prompt = `Jesteś nauczycielem angielskiego oceniającym odpowiedź ucznia.
+
+Słowo angielskie: "${wordEN}"
+Poprawne tłumaczenie polskie: "${wordPL}"${formsPrompt}
+Odpowiedź ucznia (tłumaczenie): "${userAnswer}"
+
+Oceń odpowiedź ucznia. Uwzględnij:
+- Różne formy gramatyczne (widzę = widzieć = OK)
+- Synonimy (iść = chodzić może być OK lub częściowe)
+- Literówki (1-2 znaki)
+- Czy odpowiedź jest sensowna w kontekście słowa
+
+Odpowiedz TYLKO JSON bez żadnego tekstu wokół:
+{
+  "quality": "full" | "partial" | "wrong",
+  "feedback": "krótki komentarz po polsku max 60 znaków",
+  "suggestion": "najlepsze polskie tłumaczenie"
+}
+
+quality:
+- "full" = poprawne (w tym formy gramatyczne, synonimy, drobne literówki)
+- "partial" = akceptowane ale nieprecyzyjne (inny synonim, inna forma)  
+- "wrong" = błędne lub zupełnie inne znaczenie`;
+
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 200 }
+        })
+      }
+    );
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err?.error?.message || `HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const clean = text.replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(clean);
+
+    // Merge forms result with AI quality
+    let finalQuality = parsed.quality;
+    if (!formsOk && finalQuality === "full") finalQuality = "partial";
+    if (!formsOk && finalQuality === "partial") finalQuality = "partial";
+
+    return {
+      quality: finalQuality,
+      feedback: parsed.feedback || "",
+      suggestion: parsed.suggestion || wordPL,
+      source: "ai",
+      formsDetail: formsDetail || undefined,
+    };
+  } catch (e) {
+    // AI failed — fall back to local result
+    console.warn("Gemini error:", e.message);
+    if (localResult === "none") {
+      return { quality: "wrong", feedback: `AI niedostępne. Poprawna: ${wordPL}`, suggestion: wordPL, source: "local-fallback",
+        correctDisplay: wordPL + (forms ? ` · ${forms.past} · ${forms.pp}` : "") };
+    }
+    return { quality: localResult === "full" ? "full" : "partial", feedback: `Zaakceptowano lokalnie (AI niedostępne)`, suggestion: wordPL, source: "local-fallback" };
+  }
+}
+
+// Verify Gemini key — returns { ok, error }
+async function verifyGeminiKey(key) {
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: "Say OK" }] }], generationConfig: { maxOutputTokens: 5 } })
+      }
+    );
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      return { ok: false, error: err?.error?.message || `HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  SYNONYM ENGINE  (Datamuse + Gemini)
+// ════════════════════════════════════════════════════════════
+
+// Fetch synonyms from Datamuse (free, no key)
+// Returns [{word, score}]
+async function fetchDatamuseSynonyms(word) {
+  try {
+    const r = await fetch(`https://api.datamuse.com/words?rel_syn=${encodeURIComponent(word)}&max=12`);
+    if (!r.ok) return [];
+    const data = await r.json();
+    return data.map(d => d.word).filter(Boolean);
+  } catch { return []; }
+}
+
+// Fetch related words (same meaning group, broader)
+async function fetchDatamuseRelated(word) {
+  try {
+    const [syn, trg, mlt] = await Promise.all([
+      fetch(`https://api.datamuse.com/words?rel_syn=${encodeURIComponent(word)}&max=8`).then(r=>r.json()).catch(()=>[]),
+      fetch(`https://api.datamuse.com/words?rel_trg=${encodeURIComponent(word)}&max=6`).then(r=>r.json()).catch(()=>[]),
+      fetch(`https://api.datamuse.com/words?ml=${encodeURIComponent(word)}&max=6`).then(r=>r.json()).catch(()=>[]),
+    ]);
+    const synWords = syn.map(d=>({word:d.word, type:"synonym"}));
+    const trgWords = trg.map(d=>({word:d.word, type:"related"}));
+    const mltWords = mlt.map(d=>({word:d.word, type:"similar"}));
+    // Deduplicate
+    const seen = new Set([word]);
+    return [...synWords, ...trgWords, ...mltWords].filter(x => {
+      if (seen.has(x.word)) return false;
+      seen.add(x.word); return true;
+    }).slice(0, 16);
+  } catch { return []; }
+}
+
+// Translate a list of EN words to PL using Gemini (with key)
+// Returns { word: plTranslation }
+async function translateWordsBatch(words, contextWord, userId) {
+  const key = getGeminiKey(userId);
+  if (!key || !words.length) return {};
+  try {
+    const prompt = `Przetłumacz poniższe angielskie słowa na polski.
+Kontekst: wszystkie są związane ze słowem "${contextWord}".
+Podaj TYLKO JSON: {"słowo_en": "tłumaczenie_pl", ...}
+Tłumaczenia krótkie — jedno lub dwa słowa, najbliższe znaczenie.
+
+Słowa: ${words.join(", ")}`;
+
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
+      { method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ contents:[{parts:[{text:prompt}]}], generationConfig:{temperature:0.1,maxOutputTokens:400} }) }
+    );
+    if (!res.ok) return {};
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    return JSON.parse(text.replace(/```json|```/g,"").trim());
+  } catch { return {}; }
+}
+
+// Full synonym lookup — returns [{word, pl, type}]
+async function lookupSynonyms(word, userId) {
+  const related = await fetchDatamuseRelated(word);
+  if (!related.length) return [];
+  const enWords = related.map(r => r.word);
+  const translations = await translateWordsBatch(enWords, word, userId);
+  return related.map(r => ({
+    word: r.word,
+    pl: translations[r.word] || "",
+    type: r.type,
+  }));
+}
+
+// TYPE LABELS
+const PHRASE_TYPES = {
+  phrasal_verb: { label: "Phrasal verb", color: "#f5c842" },
+  idiom:        { label: "Idiom",        color: "#a78bf0" },
+  expression:   { label: "Wyrażenie",    color: "#42c9c0" },
+  proverb:      { label: "Przysłowie",   color: "#5ec97a" },
+}
+const DEMO_WORDS = [
+  { en: "be", pl: "być", forms: { past: "was/were", pp: "been" }, category: "Czasowniki nieregularne" },
+  { en: "have", pl: "mieć", forms: { past: "had", pp: "had" }, category: "Czasowniki nieregularne" },
+  { en: "go", pl: "iść/jechać", forms: { past: "went", pp: "gone" }, category: "Czasowniki nieregularne" },
+  { en: "make", pl: "robić", forms: { past: "made", pp: "made" }, category: "Czasowniki nieregularne" },
+  { en: "come", pl: "przychodzić", forms: { past: "came", pp: "come" }, category: "Czasowniki nieregularne" },
+  { en: "know", pl: "wiedzieć", forms: { past: "knew", pp: "known" }, category: "Czasowniki nieregularne" },
+  { en: "think", pl: "myśleć", forms: { past: "thought", pp: "thought" }, category: "Czasowniki nieregularne" },
+  { en: "take", pl: "brać", forms: { past: "took", pp: "taken" }, category: "Czasowniki nieregularne" },
+  { en: "see", pl: "widzieć", forms: { past: "saw", pp: "seen" }, category: "Czasowniki nieregularne" },
+  { en: "give", pl: "dawać", forms: { past: "gave", pp: "given" }, category: "Czasowniki nieregularne" },
+  { en: "beautiful", pl: "piękny", forms: null, category: "Przymiotniki" },
+  { en: "important", pl: "ważny", forms: null, category: "Przymiotniki" },
+  { en: "difficult", pl: "trudny", forms: null, category: "Przymiotniki" },
+].map(w => ({ ...w, id: uid(), language: "en-pl", status: "approved", source: "manual", addedBy: "admin", addedAt: Date.now() }));
+
+const DEMO_PHRASES = [
+  { en: "break up", pl: "rozstać się / rozbić", example: "They broke up after two years.", example_pl: "Rozstali się po dwóch latach.", type: "phrasal_verb" },
+  { en: "give up", pl: "poddać się / zrezygnować", example: "Don't give up on your dreams.", example_pl: "Nie rezygnuj ze swoich marzeń.", type: "phrasal_verb" },
+  { en: "take over", pl: "przejąć kontrolę", example: "She took over the company.", example_pl: "Przejęła firmę.", type: "phrasal_verb" },
+  { en: "look up", pl: "sprawdzić / wyszukać", example: "Look it up in the dictionary.", example_pl: "Sprawdź to w słowniku.", type: "phrasal_verb" },
+  { en: "come up with", pl: "wymyślić / wpaść na pomysł", example: "She came up with a great idea.", example_pl: "Wpadła na świetny pomysł.", type: "phrasal_verb" },
+  { en: "once in a blue moon", pl: "raz na jakiś czas / bardzo rzadko", example: "We meet once in a blue moon.", example_pl: "Spotykamy się bardzo rzadko.", type: "idiom" },
+  { en: "break a leg", pl: "powodzenia / trzymaj kciuki", example: "Break a leg at your presentation!", example_pl: "Powodzenia na prezentacji!", type: "idiom" },
+].map(p => ({ ...p, id: uid(), category: "Zwroty", language: "en-pl", status: "approved", source: "manual", addedBy: "admin", addedAt: Date.now() }));
+
+function initData() {
+  try {
+    const r = localStorage.getItem(STORAGE_KEY);
+    if (r) {
+      const d = JSON.parse(r);
+      // Migration: ensure phrases array exists
+      if (!d.phrases) d.phrases = DEMO_PHRASES;
+      return d;
+    }
+  } catch {}
+  return {
+    users: [{ id: "u_admin", name: "Admin", pin: "1234", roles: ["admin", "teacher", "student"], classId: null, createdAt: Date.now(), xp: 0, streak: 0, lastStudyDate: null }],
+    currentUserId: null,
+    firstRun: true,
+    words: DEMO_WORDS,
+    phrases: DEMO_PHRASES,
+    categories: ["Czasowniki nieregularne", "Przymiotniki"],
+    testScopes: [],
+    classes: [],
+    sessions: [],
+    progress: {},
+  };
+}
+
+// ════════════════════════════════════════════════════════════
+//  STYLE HELPERS
+// ════════════════════════════════════════════════════════════
+const S = {
+  card: (extra = {}) => ({ background: T.s1, border: `1px solid ${T.b1}`, borderRadius: T.r2, padding: 20, ...extra }),
+  card2: (extra = {}) => ({ background: T.s2, border: `1px solid ${T.b1}`, borderRadius: T.r, padding: 14, ...extra }),
+  input: (extra = {}) => ({ background: T.s2, border: `1.5px solid ${T.b2}`, borderRadius: 8, color: T.tx, fontFamily: "'DM Mono',monospace", fontSize: 14, padding: "9px 13px", width: "100%", outline: "none", boxSizing: "border-box", ...extra }),
+  btn: (v = "primary", sm = false, extra = {}) => ({
+    display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6,
+    padding: sm ? "6px 13px" : "10px 20px",
+    borderRadius: 8, fontFamily: "'DM Sans',sans-serif", fontSize: sm ? 12 : 14, fontWeight: 500,
+    cursor: "pointer", border: "none", transition: "all .15s",
+    background: v === "primary" ? T.acc : v === "danger" ? T.acc3 : v === "success" ? T.green : v === "ghost" ? "transparent" : T.s3,
+    color: v === "primary" ? "#0d0c0b" : v === "ghost" ? T.tx2 : T.tx,
+    ...(v === "ghost" ? { border: `1px solid ${T.b2}` } : {}),
+    ...extra,
+  }),
+  label: { fontSize: 10, textTransform: "uppercase", letterSpacing: "1.5px", color: T.tx3, fontFamily: "'DM Mono',monospace", marginBottom: 5, display: "block" },
+  row: (extra = {}) => ({ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", ...extra }),
+  col: (g = 12, extra = {}) => ({ display: "flex", flexDirection: "column", gap: g, ...extra }),
+  badge: (color, extra = {}) => ({ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 20, fontSize: 11, fontFamily: "'DM Mono',monospace", background: `${color}20`, color, border: `1px solid ${color}35`, ...extra }),
+  mono: { fontFamily: "'DM Mono',monospace" },
+};
+
+// ════════════════════════════════════════════════════════════
+//  ROLE COLORS & LABELS
+// ════════════════════════════════════════════════════════════
+const ROLE_META = {
+  admin: { color: T.acc, label: "Admin", icon: "⚙️" },
+  teacher: { color: T.purple, label: "Nauczyciel", icon: "📖" },
+  student: { color: T.acc2, label: "Uczeń", icon: "🎓" },
+};
+
+function hasRole(user, role) { return user?.roles?.includes(role); }
+function isAdmin(user) { return hasRole(user, "admin"); }
+function isTeacher(user) { return hasRole(user, "teacher"); }
+
+// ════════════════════════════════════════════════════════════
+//  MAIN APP
+// ════════════════════════════════════════════════════════════
+export default function App() {
+  const [data, setData] = useState(initData);
+  const [screen, setScreen] = useState("splash");
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef();
+
+  // persist
+  useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }, [data]);
+
+  // boot
+  useEffect(() => {
+    setTimeout(() => {
+      if (data.firstRun) setScreen("onboarding");
+      else if (!data.currentUserId) setScreen("login");
+      else setScreen("home");
+    }, 1200);
+  }, []);
+
+  const showToast = useCallback((msg, color = T.acc2) => {
+    clearTimeout(toastTimer.current);
+    setToast({ msg, color });
+    toastTimer.current = setTimeout(() => setToast(null), 2800);
+  }, []);
+
+  const mutate = useCallback((fn) => {
+    setData(d => {
+      const nd = JSON.parse(JSON.stringify(d));
+      fn(nd);
+      return nd;
+    });
+  }, []);
+
+  const currentUser = data.users.find(u => u.id === data.currentUserId) || null;
+
+  // ── Actions ──────────────────────────────────────────────
+  function completeOnboarding(profile) {
+    mutate(d => {
+      const user = {
+        id: uid(), name: profile.name, pin: profile.pin,
+        roles: profile.roles, classId: null,
+        createdAt: Date.now(), xp: 0, streak: 0, lastStudyDate: null,
+      };
+      d.users = [user];
+      d.currentUserId = user.id;
+      d.firstRun = false;
+    });
+    setScreen("home");
+    showToast("Witaj! Aplikacja gotowa 🎉");
+  }
+
+  function login(userId) {
+    mutate(d => { d.currentUserId = userId; });
+    setScreen("home");
+  }
+
+  function logout() {
+    mutate(d => { d.currentUserId = null; });
+    setScreen("login");
+  }
+
+  function addUser(profile) {
+    mutate(d => {
+      d.users.push({ id: uid(), name: profile.name, pin: profile.pin, roles: profile.roles, classId: null, createdAt: Date.now(), xp: 0, streak: 0, lastStudyDate: null });
+    });
+    showToast("Dodano użytkownika");
+  }
+
+  function updateUser(id, changes) {
+    mutate(d => { const u = d.users.find(x => x.id === id); if (u) Object.assign(u, changes); });
+  }
+
+  function deleteUser(id) {
+    mutate(d => { d.users = d.users.filter(u => u.id !== id); });
+  }
+
+  function addWords(newWords) {
+    let added = 0;
+    mutate(d => {
+      if (!d.phrases) d.phrases = [];
+      newWords.forEach(w => {
+        const isPhraseType = w.type && ["phrasal_verb","idiom","expression","proverb"].includes(w.type);
+        const arr = isPhraseType ? d.phrases : d.words;
+        const exists = arr.some(x => norm(x.en) === norm(w.en) && norm(x.pl) === norm(w.pl));
+        if (!exists) {
+          arr.push({ ...w, id: uid(), status: w.status || (isTeacher(currentUser) ? "approved" : "pending"), source: w.source || "manual", addedBy: currentUser?.id || "admin", addedAt: Date.now() });
+          added++;
+        }
+        if (w.category && !d.categories.includes(w.category)) d.categories.push(w.category);
+      });
+    });
+    showToast(`Dodano ${added} słów`);
+  }
+
+  function addPhrases(newPhrases) {
+    let added = 0;
+    mutate(d => {
+      if (!d.phrases) d.phrases = [];
+      newPhrases.forEach(p => {
+        const exists = d.phrases.some(x => norm(x.en) === norm(p.en));
+        if (!exists) {
+          d.phrases.push({ ...p, id: uid(), status: "approved", source: p.source || "manual", addedBy: currentUser?.id || "admin", addedAt: Date.now() });
+          added++;
+        }
+      });
+    });
+    showToast(`Dodano ${added} zwrotów`);
+  }
+
+  function updatePhrase(id, changes) {
+    mutate(d => { if (!d.phrases) d.phrases = []; const p = d.phrases.find(x => x.id === id); if (p) Object.assign(p, changes); });
+  }
+
+  function deletePhrase(id) { mutate(d => { if (d.phrases) d.phrases = d.phrases.filter(p => p.id !== id); }); }
+
+  function updateWord(id, changes) {
+    mutate(d => {
+      const w = d.words.find(x => x.id === id);
+      if (w) Object.assign(w, changes);
+      if (changes.category && !d.categories.includes(changes.category)) d.categories.push(changes.category);
+    });
+  }
+
+  function deleteWord(id) { mutate(d => { d.words = d.words.filter(w => w.id !== id); }); }
+
+  function addCategory(cat) { if (cat && !data.categories.includes(cat)) mutate(d => { d.categories.push(cat); }); }
+
+  function addTestScope(scope) { mutate(d => { d.testScopes.push({ ...scope, id: uid(), createdAt: Date.now(), createdBy: currentUser?.id }); }); }
+  function updateTestScope(id, changes) { mutate(d => { const s = d.testScopes.find(x => x.id === id); if (s) Object.assign(s, changes); }); }
+  function deleteTestScope(id) { mutate(d => { d.testScopes = d.testScopes.filter(s => s.id !== id); }); }
+
+  function saveSession(session) {
+    mutate(d => {
+      d.sessions.unshift({ ...session, id: uid(), userId: currentUser?.id, date: Date.now() });
+      if (d.sessions.length > 200) d.sessions = d.sessions.slice(0, 200);
+      const u = d.users.find(x => x.id === currentUser?.id);
+      if (u) {
+        u.xp = (u.xp || 0) + session.xpEarned;
+        const today = new Date().toDateString();
+        if (u.lastStudyDate !== today) {
+          const yesterday = new Date(Date.now() - 86400000).toDateString();
+          u.streak = u.lastStudyDate === yesterday ? (u.streak || 0) + 1 : 1;
+          u.lastStudyDate = today;
+        }
+      }
+    });
+  }
+
+  function updateProgress(wordId, result) {
+    mutate(d => {
+      const key = `${currentUser?.id}_${wordId}`;
+      const p = d.progress[key] || { score: 0, streak: 0, nextReview: 0, lastSeen: 0 };
+      p.score = result.correct ? Math.max(0, p.score) + 1 : p.score - 1;
+      p.streak = result.correct ? p.streak + 1 : 0;
+      p.nextReview = result.correct ? Date.now() + (p.score * 8 * 3600000) : Date.now() + 1800000;
+      p.lastSeen = Date.now();
+      d.progress[key] = p;
+    });
+  }
+
+  function getProgress(wordId) {
+    return data.progress[`${currentUser?.id}_${wordId}`] || { score: 0, streak: 0, nextReview: 0, lastSeen: 0 };
+  }
+
+  function exportData() {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = `vocablab-backup-${Date.now()}.json`; a.click();
+    URL.revokeObjectURL(url);
+    showToast("Eksport gotowy");
+  }
+
+  function importData(json) {
+    try {
+      const d = JSON.parse(json);
+      if (!d.words || !d.users) throw new Error("Nieprawidłowy format");
+      setData(d);
+      showToast("Import zakończony");
+    } catch (e) { showToast("Błąd importu: " + e.message, T.red); }
+  }
+
+  // ── Render ───────────────────────────────────────────────
+  const ctx = { data, currentUser, mutate, showToast, addWords, updateWord, deleteWord, addCategory, addTestScope, updateTestScope, deleteTestScope, saveSession, updateProgress, getProgress, addUser, updateUser, deleteUser, login, logout, exportData, importData, addPhrases, updatePhrase, deletePhrase };
+
+  return (
+    <div style={{ background: T.bg, color: T.tx, minHeight: "100vh", fontFamily: "'DM Sans',sans-serif", display: "flex", flexDirection: "column", maxWidth: 480, margin: "0 auto", position: "relative" }}>
+      <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+      <style>{`
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        input:focus { border-color: ${T.acc} !important; }
+        select { appearance: none; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: ${T.b2}; border-radius: 2px; }
+        @keyframes fadeUp { from { opacity:0; transform:translateY(12px);} to { opacity:1; transform:translateY(0);} }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.4; } }
+        .fade-up { animation: fadeUp .3s ease both; }
+      `}</style>
+
+      {screen === "splash" && <SplashScreen />}
+      {screen === "onboarding" && <OnboardingScreen onDone={completeOnboarding} />}
+      {screen === "login" && <LoginScreen users={data.users} onLogin={login} />}
+      {screen === "home" && currentUser && <AppShell screen="home" ctx={ctx} />}
+      {screen === "home" && !currentUser && <LoginScreen users={data.users} onLogin={login} />}
+
+      {toast && (
+        <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: T.s3, border: `1px solid ${T.b2}`, borderRadius: 10, padding: "10px 18px", fontSize: 13, color: T.tx, zIndex: 9999, whiteSpace: "nowrap", boxShadow: "0 8px 32px rgba(0,0,0,.6)", animation: "fadeUp .25s ease" }}>
+          {toast.msg}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  SPLASH
+// ════════════════════════════════════════════════════════════
+function SplashScreen() {
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "100vh", gap: 16 }}>
+      <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 42, color: T.acc, letterSpacing: -1 }}>Vocab<span style={{ color: T.tx2, fontStyle: "italic" }}>Lab</span></div>
+      <div style={{ width: 32, height: 32, border: `3px solid ${T.b2}`, borderTopColor: T.acc, borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  ONBOARDING
+// ════════════════════════════════════════════════════════════
+function OnboardingScreen({ onDone }) {
+  const [step, setStep] = useState(0);
+  const [form, setForm] = useState({ name: "", pin: "", mode: null, roles: [], geminiKey: "" });
+  const [keyStatus, setKeyStatus] = useState(null); // null | "checking" | "ok" | "error"
+
+  const MODES = [
+    { key: "solo", label: "Tylko dla siebie", desc: "Uczysz się sam. Masz pełną kontrolę.", icon: "🧑‍💻", roles: ["admin", "teacher", "student"] },
+    { key: "teacher", label: "Nauczyciel / Rodzic", desc: "Zarządzasz bazą słów i klasą.", icon: "📖", roles: ["admin", "teacher"] },
+    { key: "student", label: "Uczeń w klasie", desc: "Dołączasz do istniejącej klasy.", icon: "🎓", roles: ["student"] },
+  ];
+
+  function finish() {
+    if (!form.name.trim() || !form.pin || form.pin.length < 4) return;
+    // Key saved to shared slot for now; after login ProfileDrawer can re-save per-user
+    if (form.geminiKey.trim()) setGeminiKey(form.geminiKey, null);
+    onDone({ name: form.name.trim(), pin: form.pin, roles: form.roles });
+  }
+
+  async function checkKey() {
+    if (!form.geminiKey.trim()) return;
+    setKeyStatus("checking");
+    const r = await verifyGeminiKey(form.geminiKey.trim());
+    setKeyStatus(r.ok ? "ok" : "error");
+  }
+
+  return (
+    <div style={{ flex: 1, minHeight: "100vh", ...S.col(0) }}>
+      <div style={{ padding: "40px 24px 24px", textAlign: "center" }}>
+        <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 36, color: T.acc, letterSpacing: -1, marginBottom: 6 }}>VocabLab</div>
+        <div style={{ fontSize: 13, color: T.tx3 }}>Pierwsze uruchomienie — krok {step + 1} / 3</div>
+        {/* Step dots */}
+        <div style={{ display: "flex", gap: 6, justifyContent: "center", marginTop: 10 }}>
+          {[0,1,2].map(i => (
+            <div key={i} style={{ width: 8, height: 8, borderRadius: "50%", background: step >= i ? T.acc : T.b2, transition: "background .2s" }} />
+          ))}
+        </div>
+      </div>
+
+      <div style={{ flex: 1, padding: "0 24px 40px" }}>
+        {/* Step 0 — choose mode */}
+        {step === 0 && (
+          <div className="fade-up" style={S.col(16)}>
+            <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 22, marginBottom: 4 }}>Jak używasz aplikacji?</div>
+            <div style={{ fontSize: 13, color: T.tx2, marginBottom: 8 }}>To ustawi Twoje uprawnienia. Możesz je zmienić później.</div>
+            {MODES.map(m => (
+              <button key={m.key} onClick={() => { setForm(f => ({ ...f, mode: m.key, roles: m.roles })); setStep(1); }}
+                style={{ background: T.s1, border: `1.5px solid ${T.b2}`, borderRadius: T.r2, padding: "18px 20px", cursor: "pointer", textAlign: "left", transition: "all .15s" }}>
+                <div style={{ fontSize: 28, marginBottom: 8 }}>{m.icon}</div>
+                <div style={{ fontSize: 16, fontWeight: 600, color: T.tx, marginBottom: 4 }}>{m.label}</div>
+                <div style={{ fontSize: 13, color: T.tx2 }}>{m.desc}</div>
+                <div style={{ marginTop: 10, ...S.row() }}>
+                  {m.roles.map(r => <span key={r} style={S.badge(ROLE_META[r].color)}>{ROLE_META[r].icon} {ROLE_META[r].label}</span>)}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Step 1 — profile */}
+        {step === 1 && (
+          <div className="fade-up" style={S.col(16)}>
+            <button onClick={() => setStep(0)} style={S.btn("ghost", true)}>← Wróć</button>
+            <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 22 }}>Twój profil</div>
+            <div>
+              <label style={S.label}>Imię lub nick</label>
+              <input style={S.input()} value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="Np. Kacper" autoFocus />
+            </div>
+            <div>
+              <label style={S.label}>PIN (min. 4 cyfry)</label>
+              <input style={S.input()} type="password" inputMode="numeric" maxLength={8} value={form.pin} onChange={e => setForm(f => ({ ...f, pin: e.target.value.replace(/\D/g, "") }))} placeholder="••••" />
+              <div style={{ fontSize: 11, color: T.tx3, marginTop: 5 }}>PIN służy do logowania do aplikacji.</div>
+            </div>
+            <div style={S.row()}>
+              <div style={{ fontSize: 12, color: T.tx3 }}>Role:</div>
+              {form.roles.map(r => <span key={r} style={S.badge(ROLE_META[r].color)}>{ROLE_META[r].icon} {ROLE_META[r].label}</span>)}
+            </div>
+            <button onClick={() => setStep(2)} style={{ ...S.btn("primary"), width: "100%", padding: "14px", fontSize: 15 }}
+              disabled={!form.name.trim() || form.pin.length < 4}>
+              Dalej →
+            </button>
+          </div>
+        )}
+
+        {/* Step 2 — Gemini API key */}
+        {step === 2 && (
+          <div className="fade-up" style={S.col(16)}>
+            <button onClick={() => setStep(1)} style={S.btn("ghost", true)}>← Wróć</button>
+            <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 22 }}>Klucz AI <span style={{ fontSize: 14, color: T.tx3, fontStyle: "italic" }}>(opcjonalnie)</span></div>
+
+            {/* What it's for */}
+            <div style={S.card2({ borderColor: T.acc2 })}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: T.acc2, marginBottom: 6 }}>Do czego służy klucz Gemini?</div>
+              <div style={S.col(6)}>
+                {[
+                  { icon: "🧠", text: "Ocenia odpowiedzi jak nauczyciel — widzę = widzieć ✓" },
+                  { icon: "🔍", text: "Tłumaczy synonimy i słowa pokrewne na polski" },
+                  { icon: "📸", text: "Analizuje zdjęcia podręczników i notatek" },
+                ].map(x => (
+                  <div key={x.icon} style={S.row({ gap: 8, alignItems: "flex-start" })}>
+                    <span style={{ fontSize: 16, flexShrink: 0 }}>{x.icon}</span>
+                    <span style={{ fontSize: 13, color: T.tx2 }}>{x.text}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* How to get key */}
+            <div style={{ fontSize: 12, color: T.tx2, lineHeight: 1.9, background: T.s2, borderRadius: T.r, padding: "12px 14px" }}>
+              Jak uzyskać klucz (bezpłatny):<br />
+              1. Wejdź na <span style={{ color: T.acc, fontFamily: "'DM Mono',monospace" }}>aistudio.google.com</span><br />
+              2. Kliknij <strong style={{ color: T.tx }}>Get API key → Create API key</strong><br />
+              3. Skopiuj klucz zaczynający się od <span style={{ fontFamily: "'DM Mono',monospace", color: T.acc2 }}>AIzaSy…</span>
+            </div>
+
+            {/* Input */}
+            <div>
+              <label style={S.label}>Klucz API Gemini</label>
+              <div style={S.row({ gap: 8 })}>
+                <input style={{ ...S.input(), flex: 1, fontFamily: "'DM Mono',monospace", fontSize: 13 }}
+                  value={form.geminiKey} onChange={e => { setForm(f => ({ ...f, geminiKey: e.target.value })); setKeyStatus(null); }}
+                  placeholder="AIzaSy…" autoComplete="off" spellCheck={false} />
+                {form.geminiKey.trim() && (
+                  <button style={S.btn("ghost", true)} onClick={checkKey} disabled={keyStatus === "checking"}>
+                    {keyStatus === "checking" ? "…" : "Sprawdź"}
+                  </button>
+                )}
+              </div>
+              {keyStatus === "ok"    && <div style={{ color: T.green, fontSize: 12, marginTop: 5 }}>✓ Klucz działa poprawnie</div>}
+              {keyStatus === "error" && <div style={{ color: T.red, fontSize: 12, marginTop: 5 }}>✗ Błędny klucz — sprawdź i spróbuj ponownie</div>}
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <button onClick={finish} style={{ ...S.btn("ghost"), width: "100%", justifyContent: "center" }}>
+                Pomiń, skonfiguruj później
+              </button>
+              <button onClick={finish} style={{ ...S.btn("primary"), width: "100%", justifyContent: "center" }}
+                disabled={!!form.geminiKey.trim() && keyStatus === "error"}>
+                {form.geminiKey.trim() ? "Zapisz i zacznij →" : "Zacznij bez AI →"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  LOGIN
+// ════════════════════════════════════════════════════════════
+function LoginScreen({ users, onLogin }) {
+  const [selected, setSelected] = useState(users[0]?.id || null);
+  const [pin, setPin] = useState("");
+  const [error, setError] = useState("");
+  const pinRef = useRef();
+
+  function doLogin() {
+    const user = users.find(u => u.id === selected);
+    if (!user) return;
+    if (user.pin !== pin) { setError("Błędny PIN"); setPin(""); return; }
+    setError(""); onLogin(user.id);
+  }
+
+  return (
+    <div style={{ flex: 1, minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 36, color: T.acc, letterSpacing: -1, marginBottom: 32 }}>VocabLab</div>
+      <div style={{ width: "100%", ...S.col(14) }}>
+        {users.length > 1 && (
+          <div>
+            <label style={S.label}>Wybierz profil</label>
+            <div style={S.col(8)}>
+              {users.map(u => (
+                <button key={u.id} onClick={() => { setSelected(u.id); setPin(""); setTimeout(() => pinRef.current?.focus(), 50); }}
+                  style={{ ...S.card2(), border: `1.5px solid ${selected === u.id ? T.acc : T.b1}`, cursor: "pointer", display: "flex", alignItems: "center", gap: 12, background: selected === u.id ? `${T.acc}10` : T.s2 }}>
+                  <div style={{ width: 38, height: 38, borderRadius: "50%", background: T.s3, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>
+                    {u.roles.includes("admin") ? "⚙️" : u.roles.includes("teacher") ? "📖" : "🎓"}
+                  </div>
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: 15 }}>{u.name}</div>
+                    <div style={{ ...S.row(), gap: 4, marginTop: 3 }}>
+                      {u.roles.map(r => <span key={r} style={S.badge(ROLE_META[r].color, { fontSize: 10, padding: "1px 6px" })}>{ROLE_META[r].label}</span>)}
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <div>
+          <label style={S.label}>PIN</label>
+          <input ref={pinRef} style={S.input()} type="password" inputMode="numeric" maxLength={8} value={pin} onChange={e => setPin(e.target.value.replace(/\D/g, ""))} onKeyDown={e => e.key === "Enter" && doLogin()} placeholder="••••" autoFocus={users.length === 1} />
+          {error && <div style={{ color: T.red, fontSize: 12, marginTop: 5 }}>{error}</div>}
+        </div>
+        <button onClick={doLogin} style={{ ...S.btn("primary"), width: "100%", padding: 13, fontSize: 15 }}>Zaloguj →</button>
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  APP SHELL (main navigation)
+// ════════════════════════════════════════════════════════════
+function AppShell({ ctx }) {
+  const { currentUser, logout } = ctx;
+  const [tab, setTab] = useState("home");
+  const [showProfile, setShowProfile] = useState(false);
+
+  const tabs = [
+    { id: "home",    icon: "🏠", label: "Start" },
+    { id: "learn",   icon: "📚", label: "Nauka" },
+    { id: "phrases", icon: "💬", label: "Zwroty" },
+    { id: "library", icon: "🗂",  label: "Baza" },
+  ];
+
+  const hasKey = !!getGeminiKey(currentUser.id);
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: "100vh" }}>
+      {/* Top bar */}
+      <div style={{ background: T.s1, borderBottom: `1px solid ${T.b1}`, padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+        <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 19, color: T.acc, letterSpacing: -0.5 }}>VocabLab</div>
+        <div style={S.row({ gap: 8 })}>
+          {(isTeacher(currentUser) || isAdmin(currentUser)) && (
+            <button onClick={() => setTab("manage")}
+              style={{ background: tab === "manage" ? `${T.acc}15` : "none", border: `1px solid ${tab === "manage" ? T.acc : T.b2}`, borderRadius: 7, padding: "4px 10px", cursor: "pointer", fontSize: 12, color: tab === "manage" ? T.acc : T.tx3 }}>
+              ⚙️
+            </button>
+          )}
+          {/* Profile button */}
+          <button onClick={() => setShowProfile(true)}
+            style={{ display: "flex", alignItems: "center", gap: 7, background: T.s2, border: `1px solid ${T.b2}`, borderRadius: 20, padding: "5px 12px 5px 8px", cursor: "pointer" }}>
+            <div style={{ width: 24, height: 24, borderRadius: "50%", background: hasKey ? `${T.green}30` : T.s3, border: `2px solid ${hasKey ? T.green : T.b2}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12 }}>
+              {currentUser.roles.includes("admin") ? "⚙️" : currentUser.roles.includes("teacher") ? "📖" : "🎓"}
+            </div>
+            <span style={{ fontSize: 13, color: T.tx2 }}>{currentUser.name}</span>
+            {!hasKey && <span style={{ fontSize: 10, color: T.acc, fontFamily: "'DM Mono',monospace" }}>AI?</span>}
+          </button>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div style={{ flex: 1, overflowY: "auto", padding: "20px 16px 80px" }}>
+        {tab === "home"    && <HomeTab ctx={ctx} />}
+        {tab === "learn"   && <LearnTab ctx={ctx} />}
+        {tab === "library" && <LibraryTab ctx={ctx} />}
+        {tab === "phrases" && <PhrasesTab ctx={ctx} />}
+        {tab === "manage"  && <ManageTab ctx={ctx} />}
+      </div>
+
+      {/* Bottom nav */}
+      <div style={{ position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 480, background: T.s1, borderTop: `1px solid ${T.b1}`, display: "flex", zIndex: 100 }}>
+        {tabs.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)}
+            style={{ flex: 1, background: "none", border: "none", padding: "10px 0 8px", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
+            <span style={{ fontSize: 22 }}>{t.icon}</span>
+            <span style={{ fontSize: 10, color: tab === t.id ? T.acc : T.tx3, fontWeight: tab === t.id ? 600 : 400 }}>{t.label}</span>
+            {tab === t.id && <div style={{ width: 20, height: 2, background: T.acc, borderRadius: 1 }} />}
+          </button>
+        ))}
+      </div>
+
+      {/* Profile drawer */}
+      {showProfile && <ProfileDrawer user={currentUser} onClose={() => setShowProfile(false)} onLogout={logout} />}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  PROFILE DRAWER  (key + settings for every user)
+// ════════════════════════════════════════════════════════════
+function ProfileDrawer({ user, onClose, onLogout }) {
+  const [key, setKey]       = useState(() => getGeminiKey(user.id));
+  const [show, setShow]     = useState(false);
+  const [status, setStatus] = useState(null); // null | "checking" | "ok" | "error" | "cleared"
+  const [errMsg, setErrMsg] = useState("");
+
+  const saved = getGeminiKey(user.id);
+
+  async function verify() {
+    if (!key.trim()) return;
+    setStatus("checking"); setErrMsg("");
+    const r = await verifyGeminiKey(key.trim());
+    if (r.ok) { setGeminiKey(key.trim(), user.id); setStatus("ok"); }
+    else { setStatus("error"); setErrMsg(r.error); }
+  }
+
+  function save() { setGeminiKey(key.trim(), user.id); setStatus("ok"); }
+
+  function clear() { setGeminiKey("", user.id); setKey(""); setStatus("cleared"); }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.7)", zIndex: 500, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
+      onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={{ background: T.s1, border: `1px solid ${T.b2}`, borderRadius: `${T.r3} ${T.r3} 0 0`, padding: "24px 20px 36px", width: "100%", maxWidth: 480, animation: "fadeUp .25s ease", maxHeight: "90vh", overflowY: "auto" }}>
+
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+          <div>
+            <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 20 }}>Mój profil</div>
+            <div style={S.row({ gap: 4, marginTop: 4 })}>
+              {user.roles.map(r => <span key={r} style={S.badge(ROLE_META[r].color, { fontSize: 10 })}>{ROLE_META[r].icon} {ROLE_META[r].label}</span>)}
+            </div>
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.tx2, cursor: "pointer", fontSize: 22 }}>✕</button>
+        </div>
+
+        {/* AI Key section */}
+        <div style={S.col(12)}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: T.tx }}>🤖 Klucz Gemini AI</div>
+
+          {/* Status banner */}
+          <div style={{ ...S.card2({ borderColor: saved ? T.green : T.acc }), background: saved ? `${T.green}08` : `${T.acc}08` }}>
+            <div style={S.row({ gap: 10 })}>
+              <span style={{ fontSize: 20 }}>{saved ? "✅" : "⚠️"}</span>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: saved ? T.green : T.acc }}>
+                  {saved ? "AI aktywne" : "Brak klucza — AI wyłączone"}
+                </div>
+                <div style={{ fontSize: 11, color: T.tx2, marginTop: 2 }}>
+                  {saved
+                    ? "Ocena odpowiedzi, synonimy i skanowanie zdjęć działają."
+                    : "Bez klucza aplikacja działa lokalnie — bez oceny AI i tłumaczeń synonimów."}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* How to get */}
+          <div style={{ fontSize: 12, color: T.tx2, lineHeight: 1.8, background: T.s2, borderRadius: T.r, padding: "10px 14px" }}>
+            Uzyskaj bezpłatny klucz na{" "}
+            <span style={{ color: T.acc, fontFamily: "'DM Mono',monospace" }}>aistudio.google.com</span>
+            {" "}→ Get API key → Create API key
+          </div>
+
+          {/* Input */}
+          <div>
+            <label style={S.label}>Klucz API</label>
+            <div style={S.row({ gap: 8 })}>
+              <input style={{ ...S.input(), flex: 1, fontFamily: "'DM Mono',monospace", fontSize: 12, letterSpacing: show ? 0 : 1 }}
+                type={show ? "text" : "password"}
+                value={key}
+                onChange={e => { setKey(e.target.value); setStatus(null); }}
+                placeholder="AIzaSy…"
+                autoComplete="off" spellCheck={false} />
+              <button style={S.btn("ghost", true)} onClick={() => setShow(s => !s)}>{show ? "🙈" : "👁"}</button>
+            </div>
+          </div>
+
+          {/* Verify status */}
+          {status === "checking" && (
+            <div style={S.row({ gap: 8, color: T.tx3, fontSize: 12 })}>
+              <div style={{ width: 12, height: 12, border: `2px solid ${T.b2}`, borderTopColor: T.acc2, borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+              Weryfikuję…
+            </div>
+          )}
+          {status === "ok"      && <div style={{ color: T.green, fontSize: 12 }}>✓ Klucz zapisany i działa</div>}
+          {status === "cleared" && <div style={{ color: T.acc2, fontSize: 12 }}>Klucz usunięty</div>}
+          {status === "error"   && <div style={{ color: T.red, fontSize: 12 }}>✗ {errMsg}</div>}
+
+          {/* Buttons */}
+          <div style={S.row({ gap: 8 })}>
+            <button style={{ ...S.btn("primary"), flex: 1, justifyContent: "center" }}
+              onClick={verify} disabled={!key.trim() || status === "checking"}>
+              {status === "checking" ? "Sprawdzam…" : "✓ Zweryfikuj i zapisz"}
+            </button>
+            {saved && <button style={S.btn("danger", true)} onClick={clear}>Usuń</button>}
+          </div>
+
+          <div style={{ height: 1, background: T.b1 }} />
+
+          {/* Logout */}
+          <button onClick={() => { onLogout(); onClose(); }}
+            style={{ ...S.btn("ghost"), width: "100%", justifyContent: "center", color: T.red, borderColor: `${T.red}40` }}>
+            Wyloguj się
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  HOME TAB
+// ════════════════════════════════════════════════════════════
+function HomeTab({ ctx }) {
+  const { data, currentUser, getProgress } = ctx;
+  const { words, sessions, testScopes } = data;
+
+  const myProgress = words.map(w => getProgress(w.id));
+  const known = myProgress.filter(p => p.score >= 4).length;
+  const learning = myProgress.filter(p => p.score > 0 && p.score < 4).length;
+  const hard = myProgress.filter(p => p.score < 0).length;
+  const due = words.filter(w => { const p = getProgress(w.id); return p.nextReview <= Date.now(); }).length;
+
+  const mySessions = sessions.filter(s => s.userId === currentUser.id);
+  const todaySessions = mySessions.filter(s => new Date(s.date).toDateString() === new Date().toDateString());
+  const todayXP = todaySessions.reduce((a, s) => a + (s.xpEarned || 0), 0);
+
+  const streak = currentUser.streak || 0;
+  const totalXP = currentUser.xp || 0;
+
+  const activeScopes = testScopes.filter(s => s.status === "active");
+
+  return (
+    <div style={S.col(16)}>
+      {/* Greeting */}
+      <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 26, letterSpacing: -0.5 }}>
+        Cześć, {currentUser.name}! {streak > 2 ? "🔥" : "👋"}
+      </div>
+
+      {/* Streak + XP */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+        {[
+          { label: "Seria dni", value: streak, unit: "🔥", color: streak > 0 ? T.acc : T.tx3 },
+          { label: "XP dziś", value: todayXP, unit: "⚡", color: T.acc2 },
+          { label: "XP łącznie", value: totalXP, unit: "🏆", color: T.purple },
+        ].map(s => (
+          <div key={s.label} style={S.card2({ textAlign: "center" })}>
+            <div style={{ fontSize: 22 }}>{s.unit}</div>
+            <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 24, color: s.color }}>{s.value}</div>
+            <div style={{ fontSize: 10, color: T.tx3, marginTop: 2 }}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Due for review */}
+      {due > 0 && (
+        <div style={S.card({ borderColor: T.acc, background: `${T.acc}08` })}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: T.acc, marginBottom: 4 }}>⏰ {due} słów do powtórzenia</div>
+          <div style={{ fontSize: 12, color: T.tx2 }}>Przejdź do Nauki → Dzienny przegląd</div>
+        </div>
+      )}
+
+      {/* Progress */}
+      <div style={S.card()}>
+        <div style={{ fontSize: 12, color: T.tx3, fontFamily: "'DM Mono',monospace", textTransform: "uppercase", letterSpacing: "1px", marginBottom: 12 }}>Postęp nauki</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8 }}>
+          {[
+            { l: "Wszystkich", v: words.length, c: T.tx2 },
+            { l: "Znam", v: known, c: T.green },
+            { l: "Uczę się", v: learning, c: T.acc2 },
+            { l: "Trudne", v: hard, c: T.red },
+          ].map(x => (
+            <div key={x.l} style={{ textAlign: "center" }}>
+              <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 26, color: x.c }}>{x.v}</div>
+              <div style={{ fontSize: 10, color: T.tx3 }}>{x.l}</div>
+            </div>
+          ))}
+        </div>
+        {/* Progress bar */}
+        <div style={{ marginTop: 14, height: 6, background: T.s3, borderRadius: 3, overflow: "hidden" }}>
+          <div style={{ height: "100%", width: `${words.length ? (known / words.length) * 100 : 0}%`, background: `linear-gradient(90deg, ${T.acc2}, ${T.green})`, borderRadius: 3, transition: "width .5s ease" }} />
+        </div>
+        <div style={{ fontSize: 11, color: T.tx3, marginTop: 5 }}>{words.length ? Math.round((known / words.length) * 100) : 0}% opanowanych</div>
+      </div>
+
+      {/* Active test scopes */}
+      {activeScopes.length > 0 && (
+        <div style={S.card()}>
+          <div style={{ fontSize: 12, color: T.tx3, fontFamily: "'DM Mono',monospace", textTransform: "uppercase", letterSpacing: "1px", marginBottom: 12 }}>Nadchodzące sprawdziany</div>
+          {activeScopes.map(s => (
+            <div key={s.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: `1px solid ${T.b1}` }}>
+              <div>
+                <div style={{ fontWeight: 500, fontSize: 14 }}>{s.name}</div>
+                <div style={{ fontSize: 12, color: T.tx3 }}>{s.wordIds.length} słów</div>
+              </div>
+              {s.dueDate && <div style={S.badge(T.acc3)}>{new Date(s.dueDate).toLocaleDateString("pl")}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Categories overview */}
+      {data.categories.length > 0 && (
+        <div style={S.card()}>
+          <div style={{ fontSize: 12, color: T.tx3, fontFamily: "'DM Mono',monospace", textTransform: "uppercase", letterSpacing: "1px", marginBottom: 12 }}>Kategorie</div>
+          <div style={S.col(8)}>
+            {data.categories.map(cat => {
+              const catWords = words.filter(w => w.category === cat);
+              const catKnown = catWords.filter(w => (getProgress(w.id).score || 0) >= 4).length;
+              const pct = catWords.length ? Math.round((catKnown / catWords.length) * 100) : 0;
+              return (
+                <div key={cat}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 4 }}>
+                    <span>{cat}</span>
+                    <span style={{ color: T.tx3, fontFamily: "'DM Mono',monospace", fontSize: 11 }}>{catKnown}/{catWords.length}</span>
+                  </div>
+                  <div style={{ height: 4, background: T.s3, borderRadius: 2, overflow: "hidden" }}>
+                    <div style={{ height: "100%", width: `${pct}%`, background: T.acc2, borderRadius: 2 }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  LEARN TAB
+// ════════════════════════════════════════════════════════════
+function LearnTab({ ctx }) {
+  const { data, currentUser, getProgress } = ctx;
+  const { words, testScopes } = data;
+  const [activeSession, setActiveSession] = useState(null);
+  const [direction, setDirection] = useState("en-pl"); // "en-pl" | "pl-en"
+
+  if (activeSession) {
+    if (activeSession.mode === "flashcard") {
+      return <FlashcardSession config={activeSession} ctx={ctx}
+        onDone={(r) => { ctx.saveSession(r); setActiveSession(null); }}
+        onExit={() => setActiveSession(null)} />;
+    }
+    return <QuizSession config={activeSession} ctx={ctx}
+      onDone={(r) => { ctx.saveSession(r); setActiveSession(null); }}
+      onExit={() => setActiveSession(null)} />;
+  }
+
+  const approvedWords = words.filter(w => w.status === "approved");
+  const dueWords = approvedWords.filter(w => getProgress(w.id).nextReview <= Date.now());
+  const hardWords = approvedWords.filter(w => getProgress(w.id).score < 0);
+  const newWords = approvedWords.filter(w => getProgress(w.id).score === 0 && getProgress(w.id).lastSeen === 0);
+
+  function start(mode, pool, extra = {}) {
+    if (!pool.length) { ctx.showToast("Brak słów w tej puli"); return; }
+    setActiveSession({ mode, pool: shuffle(pool).slice(0, extra.limit || 999), direction, ...extra });
+  }
+
+  const MODES = [
+    {
+      icon: "🃏", title: "Fiszki", color: T.acc,
+      desc: "Widzisz słowo — sam oceniasz czy wiedziałeś",
+      tag: "klasyczny Anki",
+      action: () => start("flashcard", approvedWords, { limit: 20, xpMult: 1.2 }),
+    },
+    {
+      icon: "📅", title: "Dzienny przegląd", color: T.acc2,
+      desc: `${dueWords.length} słów do powtórzenia dziś`,
+      tag: "spaced repetition",
+      action: () => start("typing", dueWords.length ? dueWords : approvedWords.slice(0, 20), { limit: 20, xpMult: 1.5 }),
+    },
+    {
+      icon: "🎲", title: "Quiz 1 z 4", color: T.blue,
+      desc: "Cztery opcje do wyboru",
+      tag: "rozgrzewka",
+      action: () => start("choice", approvedWords, { limit: 20, xpMult: 0.8 }),
+    },
+    {
+      icon: "⌨️", title: "Wpisywanie", color: T.green,
+      desc: "Wpisujesz pełną odpowiedź — z oceną AI",
+      tag: "najtrudniejszy",
+      action: () => start("typing", approvedWords, { limit: 20, xpMult: 1.5 }),
+    },
+    {
+      icon: "🆕", title: "Nowe słowa", color: T.green,
+      desc: `${newWords.length} słów których jeszcze nie znasz`,
+      tag: "pierwsze zetknięcie",
+      action: () => start("flashcard", newWords.length ? newWords : approvedWords, { limit: 15, xpMult: 1 }),
+    },
+    {
+      icon: "🔥", title: "Trudne słowa", color: T.red,
+      desc: `${hardWords.length} słów do poprawy`,
+      tag: "intensywna powtórka",
+      action: () => start("typing", hardWords.length ? hardWords : approvedWords, { limit: 15, xpMult: 2 }),
+    },
+    {
+      icon: "🔊", title: "Ze słuchu", color: T.purple,
+      desc: "Słyszysz angielskie słowo, wpisujesz znaczenie",
+      tag: "trening słuchu",
+      action: () => start("tts", approvedWords, { limit: 15, xpMult: 1.2 }),
+    },
+    {
+      icon: "🔁", title: "Sesja do zaliczenia", color: T.acc,
+      desc: "Ćwicz pулę aż każde słowo zaliczone 2× z rzędu",
+      tag: "utrwalanie",
+      action: () => start("session", approvedWords, { limit: 20, xpMult: 1.5 }),
+    },
+  ];
+
+  return (
+    <div style={S.col(14)}>
+      <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 24, letterSpacing: -0.5 }}>Nauka</div>
+
+      {/* Quick stats */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8 }}>
+        {[
+          { l: "Do powtórki", v: dueWords.length, c: T.acc },
+          { l: "Nowe", v: newWords.length, c: T.green },
+          { l: "Trudne", v: hardWords.length, c: T.red },
+        ].map(x => (
+          <div key={x.l} style={S.card2({ textAlign: "center" })}>
+            <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 22, color: x.c }}>{x.v}</div>
+            <div style={{ fontSize: 10, color: T.tx3 }}>{x.l}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Direction toggle */}
+      <div style={S.card2()}>
+        <div style={{ fontSize: 11, color: T.tx3, fontFamily: "'DM Mono',monospace", textTransform: "uppercase", letterSpacing: "1px", marginBottom: 8 }}>Kierunek tłumaczenia</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          {[
+            { v: "en-pl", label: "🇬🇧 → 🇵🇱", sub: "Angielski → Polski" },
+            { v: "pl-en", label: "🇵🇱 → 🇬🇧", sub: "Polski → Angielski" },
+          ].map(d => (
+            <button key={d.v} onClick={() => setDirection(d.v)}
+              style={{ background: direction === d.v ? `${T.acc}12` : T.s3, border: `1.5px solid ${direction === d.v ? T.acc : T.b2}`, borderRadius: T.r, padding: "10px 12px", cursor: "pointer", textAlign: "center", transition: "all .15s" }}>
+              <div style={{ fontSize: 18, marginBottom: 2 }}>{d.label}</div>
+              <div style={{ fontSize: 11, color: direction === d.v ? T.acc : T.tx3 }}>{d.sub}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Mode list */}
+      <div style={S.col(8)}>
+        {MODES.map(m => (
+          <button key={m.title} onClick={m.action}
+            style={{ background: T.s1, border: `1px solid ${T.b1}`, borderRadius: T.r, padding: "13px 16px", cursor: "pointer", display: "flex", alignItems: "center", gap: 14, textAlign: "left", transition: "border-color .15s" }}>
+            <div style={{ fontSize: 26, width: 36, textAlign: "center", flexShrink: 0 }}>{m.icon}</div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 600, fontSize: 14, color: m.color }}>{m.title}</div>
+              <div style={{ fontSize: 12, color: T.tx3, marginTop: 1 }}>{m.desc}</div>
+            </div>
+            <span style={{ ...S.badge(m.color, {}), fontSize: 10, flexShrink: 0, whiteSpace: "nowrap" }}>{m.tag}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Active test scopes */}
+      {testScopes.filter(s => s.status === "active").length > 0 && (
+        <div>
+          <div style={{ fontSize: 12, color: T.tx3, fontFamily: "'DM Mono',monospace", textTransform: "uppercase", letterSpacing: "1px", marginBottom: 10 }}>Sprawdziany</div>
+          {testScopes.filter(s => s.status === "active").map(scope => {
+            const scopeWords = data.words.filter(w => scope.wordIds.includes(w.id));
+            return (
+              <button key={scope.id} onClick={() => start("test", scopeWords, { scopeId: scope.id, xpMult: 2 })}
+                style={S.card({ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center", border: `1px solid ${T.acc3}`, marginBottom: 8 })}>
+                <div>
+                  <div style={{ fontWeight: 600 }}>{scope.name}</div>
+                  <div style={{ fontSize: 12, color: T.tx3, marginTop: 3 }}>{scopeWords.length} słów{scope.dueDate ? ` · ${new Date(scope.dueDate).toLocaleDateString("pl")}` : ""}</div>
+                </div>
+                <div style={S.badge(T.acc3)}>TEST</div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  FLASHCARD SESSION  (Anki-style self-assessment)
+// ════════════════════════════════════════════════════════════
+function FlashcardSession({ config, ctx, onDone, onExit }) {
+  const { pool, xpMult = 1, direction = "en-pl" } = config;
+  const [queue, setQueue] = useState(() => shuffle([...pool]));
+  const [idx, setIdx] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+  const [stats, setStats] = useState({ knew: 0, didnt: 0 });
+  const [done, setDone] = useState(false);
+  const [exitAnim, setExitAnim] = useState(null); // "knew" | "didnt"
+
+  // Keyboard support
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key === " " || e.key === "ArrowUp") { e.preventDefault(); if (!flipped) flip(); }
+      if (e.key === "ArrowRight" && flipped) respond(true);
+      if (e.key === "ArrowLeft"  && flipped) respond(false);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [flipped]);
+
+  const current = queue[idx];
+  const progress = Math.round((idx / Math.max(queue.length, 1)) * 100);
+
+  const front = direction === "en-pl" ? current?.en : current?.pl;
+  const back  = direction === "en-pl" ? current?.pl : current?.en;
+  const backForms = direction === "en-pl" && current?.forms
+    ? `${current.forms.past} · ${current.forms.pp}` : null;
+
+  function flip() { if (!flipped) setFlipped(true); }
+
+  function respond(knew) {
+    setExitAnim(knew ? "knew" : "didnt");
+    ctx.updateProgress(current.id, { correct: knew });
+    setStats(s => ({ knew: s.knew + (knew ? 1 : 0), didnt: s.didnt + (knew ? 0 : 1) }));
+
+    // Re-queue if didn't know
+    if (!knew) {
+      setQueue(q => {
+        const nq = [...q];
+        const ri = Math.min(idx + 2 + Math.floor(Math.random() * 3), nq.length);
+        nq.splice(ri, 0, { ...current });
+        return nq;
+      });
+    }
+
+    setTimeout(() => {
+      setExitAnim(null);
+      setFlipped(false);
+      if (idx + 1 >= queue.length) {
+        const xpEarned = Math.round(stats.knew * 10 * xpMult);
+        onDone({ mode: "flashcard", correct: stats.knew + (knew ? 1 : 0), wrong: stats.didnt + (knew ? 0 : 1), total: pool.length, xpEarned });
+        setDone(true);
+      } else {
+        setIdx(i => i + 1);
+      }
+    }, 280);
+  }
+
+  if (done) return null;
+  if (!current) return null;
+
+  const dirLabel = direction === "en-pl" ? "EN → PL" : "PL → EN";
+
+  return (
+    <div style={S.col(14)}>
+      {/* Header */}
+      <div style={S.row({ justifyContent: "space-between" })}>
+        <div style={S.col(2, { gap: 2 })}>
+          <div style={{ fontSize: 11, color: T.tx3, fontFamily: "'DM Mono',monospace", textTransform: "uppercase", letterSpacing: "1px" }}>
+            Fiszki · {dirLabel} · {idx + 1}/{queue.length}
+          </div>
+          <div style={S.row({ gap: 8 })}>
+            <span style={{ fontSize: 11, color: T.green }}>✓ {stats.knew}</span>
+            <span style={{ fontSize: 11, color: T.red }}>✗ {stats.didnt}</span>
+          </div>
+        </div>
+        <button onClick={onExit} style={S.btn("ghost", true)}>✕ Zakończ</button>
+      </div>
+
+      {/* Progress */}
+      <div style={{ height: 4, background: T.s3, borderRadius: 2, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${progress}%`, background: `linear-gradient(90deg,${T.acc2},${T.acc})`, borderRadius: 2, transition: "width .4s ease" }} />
+      </div>
+
+      {/* Card */}
+      <div
+        onClick={!flipped ? flip : undefined}
+        style={{
+          ...S.card({ minHeight: 200, cursor: flipped ? "default" : "pointer", userSelect: "none",
+            transform: exitAnim === "knew" ? "translateX(80px)" : exitAnim === "didnt" ? "translateX(-80px)" : "none",
+            opacity: exitAnim ? 0 : 1,
+            transition: exitAnim ? "all .25s ease" : "border-color .2s",
+            border: `1px solid ${flipped ? T.acc2 : T.b1}`,
+          }),
+          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", gap: 12,
+        }}
+      >
+        {/* Direction label */}
+        <div style={{ fontSize: 10, color: T.tx3, fontFamily: "'DM Mono',monospace", textTransform: "uppercase", letterSpacing: "1.5px" }}>
+          {flipped ? (direction === "en-pl" ? "Polski" : "Angielski") : (direction === "en-pl" ? "Angielski" : "Polski")}
+        </div>
+
+        {/* Front */}
+        <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: "clamp(28px,7vw,48px)", letterSpacing: -0.5, lineHeight: 1.1, color: flipped ? T.tx2 : T.tx }}>
+          {front}
+        </div>
+
+        {/* Back — revealed on flip */}
+        {!flipped && (
+          <div style={{ fontSize: 13, color: T.tx3, marginTop: 4 }}>
+            Dotknij aby odkryć →
+          </div>
+        )}
+
+        {flipped && (
+          <div style={{ borderTop: `1px solid ${T.b1}`, paddingTop: 14, width: "100%" }}>
+            <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: "clamp(24px,6vw,40px)", color: T.acc, letterSpacing: -0.5, lineHeight: 1.15 }}>
+              {back}
+            </div>
+            {backForms && (
+              <div style={{ marginTop: 8, fontFamily: "'DM Mono',monospace", fontSize: 14, color: T.tx3 }}>
+                {backForms}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Self-assessment buttons — only after flip */}
+      {flipped ? (
+        <div style={S.col(10)}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <button onClick={() => respond(false)}
+              style={{ background: `${T.red}12`, border: `1.5px solid ${T.red}50`, borderRadius: T.r2, padding: "16px 12px", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, transition: "all .12s" }}>
+              <span style={{ fontSize: 28 }}>😕</span>
+              <span style={{ fontSize: 14, fontWeight: 700, color: T.red }}>Nie wiedziałem</span>
+              <span style={{ fontSize: 11, color: T.tx3 }}>Wróci do powtórki</span>
+            </button>
+            <button onClick={() => respond(true)}
+              style={{ background: `${T.green}12`, border: `1.5px solid ${T.green}50`, borderRadius: T.r2, padding: "16px 12px", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, transition: "all .12s" }}>
+              <span style={{ fontSize: 28 }}>😊</span>
+              <span style={{ fontSize: 14, fontWeight: 700, color: T.green }}>Wiedziałem!</span>
+              <span style={{ fontSize: 11, color: T.tx3 }}>+XP · do przodu</span>
+            </button>
+          </div>
+          {/* Synonimy — dostępne po odkryciu w każdym trybie */}
+          <SynonymPanel word={current} ctx={ctx} />
+        </div>
+      ) : (
+        <button onClick={flip} style={{ ...S.btn("primary"), width: "100%", justifyContent: "center", fontSize: 15, padding: "14px" }}>
+          Odkryj odpowiedź
+        </button>
+      )}
+
+      {/* Keyboard hint */}
+      <div style={{ textAlign: "center", fontSize: 11, color: T.tx3 }}>
+        {!flipped ? "Spacja = odkryj" : "← Nie wiedziałem  ·  Wiedziałem →"}
+      </div>
+    </div>
+  );
+}
+
+
+// ════════════════════════════════════════════════════════════
+//  QUIZ SESSION  (with AI evaluation)
+// ════════════════════════════════════════════════════════════
+function QuizSession({ config, ctx, onDone, onExit }) {
+  const { mode, pool, xpMult = 1, scopeId, direction = "en-pl" } = config;
+  const isChoiceMode = mode === "choice" || mode === "choice3";
+  const choiceCount = mode === "choice3" ? 2 : 3; // 2 wrong + 1 correct = 3 or 4
+  const [queue, setQueue] = useState(() => mode === "session" ? pool.map(w => ({ ...w, _streak: 0 })) : [...pool]);
+  const [idx, setIdx] = useState(0);
+  const [phase, setPhase] = useState("input"); // "input" | "evaluating" | "result"
+  const [evaluation, setEvaluation] = useState(null);
+  const [inputVal, setInputVal] = useState("");
+  const [formsVal, setFormsVal] = useState({ past: "", pp: "" });
+  const [hintLevel, setHintLevel] = useState(0);
+  const [sessionStats, setSessionStats] = useState({ correct: 0, partial: 0, wrong: 0 });
+  const [choices, setChoices] = useState([]);
+  const [done, setDone] = useState(false);
+  const inputRef = useRef();
+
+  const current = queue[idx];
+  const progress = Math.round((idx / Math.max(queue.length, 1)) * 100);
+  const hasKey = !!getGeminiKey(ctx.currentUser?.id);
+
+  // Direction helpers
+  // en-pl: show EN, answer PL
+  // pl-en: show PL, answer EN
+  const promptText  = current ? (direction === "en-pl" ? current.en : current.pl) : "";
+  const answerField = direction === "en-pl" ? current?.pl : current?.en;
+  const promptLabel = direction === "en-pl" ? "Angielski → Polski" : "Polski → Angielski";
+  const inputLabel  = direction === "en-pl" ? "Polskie znaczenie" : "Angielskie słowo";
+  const inputPlaceholder = direction === "en-pl" ? "Wpisz polskie tłumaczenie…" : "Write in English…";
+
+  // choice options — respect direction
+  useEffect(() => {
+    if (!isChoiceMode || !current) return;
+    const others = shuffle(ctx.data.words.filter(w => w.id !== current.id)).slice(0, choiceCount);
+    const allOpts = shuffle([current, ...others]);
+    setChoices(allOpts.map(w => direction === "en-pl" ? w.pl : w.en));
+  }, [idx, mode, direction]);
+
+  // tts auto-speak
+  useEffect(() => {
+    if (mode === "tts" && current) {
+      setTimeout(() => { const u = new SpeechSynthesisUtterance(current.en); u.lang = "en-US"; u.rate = 0.85; window.speechSynthesis?.speak(u); }, 300);
+    }
+  }, [idx, mode]);
+
+  useEffect(() => { if (inputRef.current && phase === "input") inputRef.current.focus(); }, [idx, phase]);
+
+  const hasForms = !!(current?.forms) && mode !== "tts" && !isChoiceMode && direction === "en-pl";
+
+  // hint: show N letters of correct answer
+  function getHint() {
+    const target = current.pl.split("/")[0].trim();
+    if (hintLevel === 0) return null;
+    return target.slice(0, hintLevel) + "…";
+  }
+
+  async function check(choiceVal = null) {
+    if (phase !== "input") return;
+    const ans = choiceVal !== null ? choiceVal : inputVal;
+    if (!ans.trim() && !choiceVal) return;
+
+    setPhase("evaluating");
+
+    let result;
+    if (isChoiceMode) {
+      const correct = normPL(ans) === normPL(answerField) ||
+        (answerField || "").split("/").map(a => normPL(a.trim())).includes(normPL(ans));
+      result = { quality: correct ? "full" : "wrong", feedback: correct ? "Poprawnie!" : `Błąd.`, suggestion: answerField || "", source: "local" };
+    } else {
+      // For pl-en: evaluate English answer (no AI grammar check needed — exact/fuzzy match)
+      if (direction === "pl-en") {
+        const lm = localMatch(ans, current.en);
+        if (lm === "full")    result = { quality: "full",    feedback: "Idealnie!", suggestion: current.en, source: "local" };
+        else if (lm === "typo") result = { quality: "partial", feedback: "Literówka — prawie!", suggestion: current.en, source: "local" };
+        else                  result = { quality: "wrong",   feedback: `Poprawnie: ${current.en}`, suggestion: current.en, source: "local" };
+      } else {
+        result = await evaluateAnswer({
+          wordEN: current.en,
+          wordPL: current.pl,
+          userAnswer: ans,
+          forms: current.forms || null,
+          formsAnswer: hasForms ? formsVal : null,
+          userId: ctx.currentUser?.id,
+        });
+      }
+    }
+
+    setEvaluation({ ...result, userAnswer: ans, formsAnswer: hasForms ? { ...formsVal } : null });
+    setPhase("result");
+
+    const isCorrect = result.quality === "full" || result.quality === "partial";
+    const isFullCorrect = result.quality === "full";
+
+    setSessionStats(s => ({
+      correct: s.correct + (isFullCorrect ? 1 : 0),
+      partial: s.partial + (result.quality === "partial" ? 1 : 0),
+      wrong:   s.wrong   + (result.quality === "wrong" ? 1 : 0),
+    }));
+
+    ctx.updateProgress(current.id, { correct: isCorrect });
+
+    if (mode === "session" && !isCorrect) {
+      setQueue(q => {
+        const nq = [...q];
+        const ri = Math.min(idx + 2 + Math.floor(Math.random() * 3), nq.length);
+        nq.splice(ri, 0, { ...current, _streak: 0 });
+        return nq;
+      });
+    }
+  }
+
+  function next() {
+    if (idx + 1 >= queue.length) { finish(); return; }
+    setIdx(i => i + 1);
+    setPhase("input");
+    setEvaluation(null);
+    setInputVal("");
+    setFormsVal({ past: "", pp: "" });
+    setHintLevel(0);
+  }
+
+  function finish() {
+    const xpEarned = Math.round((sessionStats.correct + sessionStats.partial * 0.7) * 10 * xpMult);
+    onDone({ mode, correct: sessionStats.correct, partial: sessionStats.partial, wrong: sessionStats.wrong, total: queue.length, xpEarned, scopeId });
+    setDone(true);
+  }
+
+  if (done) return null;
+  if (!current) { finish(); return null; }
+
+  const modeLabels = { typing: "Wpisywanie", choice: "Quiz wyboru", tts: "Ze słuchu", session: "Sesja do zaliczenia", test: "Sprawdzian", daily: "Dzienny przegląd" };
+
+  // Feedback colors
+  const qualityColor = evaluation ? (evaluation.quality === "full" ? T.green : evaluation.quality === "partial" ? T.acc : T.red) : T.b1;
+  const qualityBg    = evaluation ? (evaluation.quality === "full" ? `${T.green}08` : evaluation.quality === "partial" ? `${T.acc}08` : `${T.red}08`) : T.s1;
+  const qualityIcon  = evaluation ? (evaluation.quality === "full" ? "✓" : evaluation.quality === "partial" ? "≈" : "✗") : "";
+  const qualityLabel = evaluation ? (evaluation.quality === "full" ? "Poprawnie!" : evaluation.quality === "partial" ? "Prawie dobrze" : "Błąd") : "";
+
+  const hint = getHint();
+
+  return (
+    <div style={S.col(14)}>
+
+      {/* Header */}
+      <div style={S.row({ justifyContent: "space-between" })}>
+        <div style={S.col(2, { gap: 2 })}>
+          <div style={{ fontSize: 11, color: T.tx3, fontFamily: "'DM Mono',monospace", textTransform: "uppercase", letterSpacing: "1px" }}>
+            {modeLabels[mode]} · {idx + 1}/{queue.length}
+          </div>
+          <div style={S.row({ gap: 8 })}>
+            <span style={{ fontSize: 11, color: T.green }}>✓ {sessionStats.correct}</span>
+            <span style={{ fontSize: 11, color: T.acc }}>≈ {sessionStats.partial}</span>
+            <span style={{ fontSize: 11, color: T.red }}>✗ {sessionStats.wrong}</span>
+            {hasKey && <span style={{ fontSize: 10, color: T.tx3, fontFamily: "'DM Mono',monospace" }}>AI ✦</span>}
+          </div>
+        </div>
+        <button onClick={onExit} style={S.btn("ghost", true)}>✕ Zakończ</button>
+      </div>
+
+      {/* Progress bar */}
+      <div style={{ height: 4, background: T.s3, borderRadius: 2, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${progress}%`, background: `linear-gradient(90deg,${T.acc2},${T.acc})`, borderRadius: 2, transition: "width .4s ease" }} />
+      </div>
+
+      {/* Question card */}
+      <div style={S.card({ textAlign: "center", background: phase === "result" ? qualityBg : T.s1, border: `1px solid ${phase === "result" ? qualityColor : T.b1}`, transition: "all .25s" })}>
+        <div style={{ fontSize: 10, color: T.tx3, fontFamily: "'DM Mono',monospace", textTransform: "uppercase", letterSpacing: "1.5px", marginBottom: 10 }}>
+          {mode === "tts" ? "Ze słuchu" : promptLabel}
+        </div>
+
+        {/* Prompt */}
+        {mode === "tts" ? (
+          <div>
+            <button onClick={() => { const u = new SpeechSynthesisUtterance(current.en); u.lang = "en-US"; u.rate = 0.85; window.speechSynthesis?.speak(u); }}
+              style={{ fontSize: 52, background: "none", border: "none", cursor: "pointer", display: "block", margin: "0 auto 6px" }}>🔊</button>
+            <div style={{ fontSize: 11, color: T.tx3 }}>Dotknij aby posłuchać ponownie</div>
+          </div>
+        ) : (
+          <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: "clamp(26px,6vw,44px)", letterSpacing: -0.5, lineHeight: 1.1 }}>
+            {promptText}
+          </div>
+        )}
+
+        {/* Hint */}
+        {hint && phase === "input" && (
+          <div style={{ marginTop: 8, fontFamily: "'DM Mono',monospace", fontSize: 16, color: T.acc, letterSpacing: 2 }}>
+            {hint}
+          </div>
+        )}
+
+        {/* ── FEEDBACK after answer ── */}
+        {phase === "evaluating" && (
+          <div style={{ marginTop: 16, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, color: T.tx3 }}>
+            <div style={{ width: 16, height: 16, border: `2px solid ${T.b2}`, borderTopColor: T.acc2, borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+            <span style={{ fontSize: 13 }}>Oceniam odpowiedź…</span>
+          </div>
+        )}
+
+        {phase === "result" && evaluation && (
+          <div style={{ marginTop: 16 }}>
+            {/* Quality badge */}
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "8px 16px", background: `${qualityColor}18`, border: `1px solid ${qualityColor}40`, borderRadius: 10, marginBottom: 10 }}>
+              <span style={{ fontSize: 18, color: qualityColor }}>{qualityIcon}</span>
+              <span style={{ fontSize: 14, fontWeight: 700, color: qualityColor }}>{qualityLabel}</span>
+              {evaluation.source === "ai" && <span style={{ fontSize: 10, color: T.tx3, fontFamily: "'DM Mono',monospace" }}>AI</span>}
+            </div>
+
+            {/* What user wrote */}
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ fontSize: 10, color: T.tx3, textTransform: "uppercase", letterSpacing: "1px", fontFamily: "'DM Mono',monospace", marginBottom: 4 }}>Twoja odpowiedź</div>
+              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 15, color: evaluation.quality === "wrong" ? T.red : T.tx, padding: "6px 12px", background: T.s3, borderRadius: 6, display: "inline-block" }}>
+                {evaluation.userAnswer || "—"}
+              </div>
+            </div>
+
+            {/* Correct answer — always shown */}
+            <div style={{ marginBottom: evaluation.feedback ? 8 : 0 }}>
+              <div style={{ fontSize: 10, color: T.tx3, textTransform: "uppercase", letterSpacing: "1px", fontFamily: "'DM Mono',monospace", marginBottom: 4 }}>Poprawna odpowiedź</div>
+              <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 15, color: T.green, padding: "6px 12px", background: `${T.green}10`, borderRadius: 6, display: "inline-block" }}>
+                {answerField}
+              </div>
+            </div>
+
+            {/* Forms feedback */}
+            {current.forms && (
+              <div style={{ marginTop: 8 }}>
+                <div style={{ fontSize: 10, color: T.tx3, textTransform: "uppercase", letterSpacing: "1px", fontFamily: "'DM Mono',monospace", marginBottom: 4 }}>Formy czasownika</div>
+                <div style={{ display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+                  {[
+                    { label: "Past", correct: current.forms.past, given: evaluation.formsAnswer?.past },
+                    { label: "PP",   correct: current.forms.pp,   given: evaluation.formsAnswer?.pp },
+                  ].map(f => {
+                    const fOk = f.given ? localMatch(f.given, f.correct) !== "none" : false;
+                    return (
+                      <div key={f.label} style={{ textAlign: "center" }}>
+                        <div style={{ fontSize: 10, color: T.tx3, marginBottom: 2 }}>{f.label}</div>
+                        {f.given && (
+                          <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 12, color: fOk ? T.green : T.red, textDecoration: fOk ? "none" : "line-through", marginBottom: 1 }}>
+                            {f.given}
+                          </div>
+                        )}
+                        <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 13, color: T.green, background: `${T.green}10`, padding: "3px 8px", borderRadius: 5 }}>
+                          {f.correct}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* AI feedback message */}
+            {evaluation.feedback && evaluation.quality !== "full" && (
+              <div style={{ marginTop: 10, fontSize: 12, color: T.tx2, fontStyle: "italic", padding: "6px 12px", background: T.s3, borderRadius: 6 }}>
+                💬 {evaluation.feedback}
+              </div>
+            )}
+
+            {/* Suggestion if different from correct */}
+            {evaluation.suggestion && normPL(evaluation.suggestion) !== normPL(current.pl) && (
+              <div style={{ marginTop: 6, fontSize: 12, color: T.acc2 }}>
+                Lepsze tłumaczenie: <strong style={{ fontFamily: "'DM Mono',monospace" }}>{evaluation.suggestion}</strong>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Answer input area */}
+      {phase === "input" && (
+        <div style={S.card()}>
+          {isChoiceMode ? (
+            <div style={{ display: "grid", gridTemplateColumns: mode === "choice3" ? "1fr 1fr 1fr" : "1fr 1fr", gap: 10 }}>
+              {choices.map((c, i) => (
+                <button key={i} onClick={() => check(c)}
+                  style={{ background: T.s2, border: `1.5px solid ${T.b2}`, borderRadius: T.r, padding: "14px 10px", cursor: "pointer", fontFamily: "'DM Mono',monospace", fontSize: mode === "choice3" ? 12 : 13, color: T.tx, transition: "all .12s", textAlign: "center", lineHeight: 1.3 }}>
+                  {c}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div style={S.col(10)}>
+              <div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
+                  <label style={S.label}>{inputLabel}</label>
+                  {direction === "en-pl" && (
+                    <button onClick={() => setHintLevel(l => Math.min(l + 1, 4))}
+                      style={{ background: "none", border: `1px solid ${T.b2}`, borderRadius: 6, padding: "2px 8px", fontSize: 11, color: T.tx3, cursor: "pointer" }}>
+                      💡 Podpowiedź
+                    </button>
+                  )}
+                </div>
+                <input ref={inputRef} style={S.input()} value={inputVal}
+                  onChange={e => setInputVal(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && check()}
+                  placeholder={hint ? `Zaczyna się od: ${hint}` : inputPlaceholder}
+                  autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} />
+              </div>
+
+              {hasForms && (
+                <div>
+                  <label style={S.label}>Formy czasownika</label>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    <div>
+                      <label style={{ ...S.label, color: T.tx3 }}>Past</label>
+                      <input style={S.input()} value={formsVal.past}
+                        onChange={e => setFormsVal(v => ({ ...v, past: e.target.value }))}
+                        onKeyDown={e => e.key === "Enter" && check()}
+                        placeholder="np. went" autoComplete="off" spellCheck={false} />
+                    </div>
+                    <div>
+                      <label style={{ ...S.label, color: T.tx3 }}>Past Participle</label>
+                      <input style={S.input()} value={formsVal.pp}
+                        onChange={e => setFormsVal(v => ({ ...v, pp: e.target.value }))}
+                        onKeyDown={e => e.key === "Enter" && check()}
+                        placeholder="np. gone" autoComplete="off" spellCheck={false} />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <button onClick={() => check()} style={{ ...S.btn("primary"), alignSelf: "flex-end", minWidth: 100 }}>
+                Sprawdź →
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Navigation after result */}
+      {phase === "result" && (
+        <div style={S.col(8)}>
+          <div style={S.row({ justifyContent: "center", gap: 10 })}>
+            {mode === "test" && evaluation?.quality === "wrong" ? (
+              <button onClick={finish} style={S.btn("danger")}>Zakończ test</button>
+            ) : (
+              <button onClick={next} style={S.btn("primary")}>
+                {idx + 1 >= queue.length ? "Zakończ 🎉" : "Następne →"}
+              </button>
+            )}
+          </div>
+          {/* Synonym panel — all modes */}
+          <SynonymPanel word={current} ctx={ctx} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  SYNONYM PANEL  (inline in quiz + library)
+// ════════════════════════════════════════════════════════════
+function SynonymPanel({ word, ctx, autoOpen = false }) {
+  const [open, setOpen] = useState(autoOpen);
+  const [loading, setLoading] = useState(autoOpen);
+  const [results, setResults] = useState([]);
+  const [checked, setChecked] = useState({});
+  const [added, setAdded] = useState(false);
+  const [offline, setOffline] = useState(false);
+
+  const userId = ctx.currentUser?.id;
+  const hasKey = !!getGeminiKey(userId);
+
+  useEffect(() => {
+    if (autoOpen) { doLoad(); }
+  }, []);
+
+  async function doLoad() {
+    setLoading(true);
+    setOffline(false);
+    try {
+      const syns = await lookupSynonyms(word.en, userId);
+      setResults(syns);
+      if (!syns.length && !navigator.onLine) setOffline(true);
+    } catch {
+      setOffline(true);
+    }
+    setLoading(false);
+  }
+
+  async function load() {
+    if (results.length) { setOpen(o => !o); return; }
+    setOpen(true);
+    await doLoad();
+  }
+
+  function toggleCheck(w) { setChecked(c => ({ ...c, [w]: !c[w] })); }
+
+  function addSelected() {
+    const toAdd = results
+      .filter(r => checked[r.word])
+      .map(r => ({
+        en: r.word, pl: r.pl || "", category: word.category || "Synonimy",
+        forms: null, language: "en-pl", status: "approved", source: "synonym",
+      }));
+    if (!toAdd.length) return;
+    ctx.addWords(toAdd);
+    setAdded(true);
+    setChecked({});
+    setTimeout(() => setAdded(false), 2000);
+  }
+
+  const typeColors = { synonym: T.acc2, related: T.purple, similar: T.blue };
+  const typeLabels = { synonym: "synonim", related: "pokrewne", similar: "podobne" };
+  const checkedCount = Object.values(checked).filter(Boolean).length;
+
+  return (
+    <div>
+      <button onClick={load}
+        style={{ ...S.btn("ghost", true), width: "100%", justifyContent: "center", gap: 6 }}>
+        🔍 Zobacz synonimy i słowa pokrewne
+      </button>
+
+      {open && (
+        <div style={{ ...S.card({ marginTop: 8 }), borderColor: T.acc2 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>
+              Słowa pokrewne do: <span style={{ color: T.acc, fontFamily: "'DM Mono',monospace" }}>{word.en}</span>
+            </div>
+            <button onClick={() => setOpen(false)} style={{ background: "none", border: "none", color: T.tx3, cursor: "pointer", fontSize: 16 }}>✕</button>
+          </div>
+
+          {loading && (
+            <div style={S.row({ justifyContent: "center", gap: 8, padding: "16px 0", color: T.tx3 })}>
+              <div style={{ width: 14, height: 14, border: `2px solid ${T.b2}`, borderTopColor: T.acc2, borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+              <span style={{ fontSize: 13 }}>Szukam synonimów…</span>
+            </div>
+          )}
+
+          {!loading && (results.length === 0 || offline) && (
+            <div style={S.col(8, { padding: "8px 0" })}>
+              {offline ? (
+                <div style={{ fontSize: 13, color: T.acc3, textAlign: "center" }}>
+                  📡 Brak połączenia z internetem.<br />
+                  <span style={{ fontSize: 11, color: T.tx3 }}>Synonimy pobierane są online (Datamuse API).</span>
+                </div>
+              ) : results.length === 0 ? (
+                <div style={{ fontSize: 13, color: T.tx3, textAlign: "center" }}>
+                  Brak synonimów dla tego słowa.
+                  {!hasKey && <div style={{ fontSize: 11, marginTop: 4 }}>Dodaj klucz Gemini dla tłumaczeń PL — kliknij swoje imię w górze ekranu.</div>}
+                </div>
+              ) : null}
+              <button onClick={doLoad} style={{ ...S.btn("ghost", true), alignSelf: "center" }}>↺ Spróbuj ponownie</button>
+            </div>
+          )}
+
+          {!loading && results.length > 0 && (
+            <>
+              <div style={S.col(6)}>
+                {results.map(r => {
+                  const alreadyInBase = ctx.data.words.some(w => norm(w.en) === norm(r.word));
+                  return (
+                    <label key={r.word}
+                      style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 10px", background: checked[r.word] ? `${T.acc2}12` : T.s2, borderRadius: 8, cursor: alreadyInBase ? "default" : "pointer", border: `1px solid ${checked[r.word] ? T.acc2 : T.b1}`, transition: "all .1s" }}>
+                      <input type="checkbox" checked={!!checked[r.word]} disabled={alreadyInBase}
+                        onChange={() => !alreadyInBase && toggleCheck(r.word)}
+                        style={{ accentColor: T.acc2, width: 15, height: 15, flexShrink: 0 }} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 14, fontWeight: 500 }}>{r.word}</span>
+                          <span style={S.badge(typeColors[r.type] || T.tx3, { fontSize: 9 })}>{typeLabels[r.type] || r.type}</span>
+                          {alreadyInBase && <span style={{ fontSize: 10, color: T.green }}>✓ w bazie</span>}
+                        </div>
+                        {r.pl && <div style={{ fontSize: 12, color: T.tx2, marginTop: 1 }}>{r.pl}</div>}
+                      </div>
+                    </label>
+                  );
+                })}
+              </div>
+
+              {checkedCount > 0 && (
+                <button onClick={addSelected}
+                  style={{ ...S.btn("primary"), width: "100%", justifyContent: "center", marginTop: 10 }}>
+                  {added ? "✓ Dodano!" : `Dodaj zaznaczone do bazy (${checkedCount})`}
+                </button>
+              )}
+              {!hasKey && (
+                <div style={{ fontSize: 11, color: T.tx3, marginTop: 8, textAlign: "center" }}>
+                  💡 Kliknij swoje imię w górze ekranu → dodaj klucz Gemini aby uzyskać polskie tłumaczenia
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  PHRASES TAB  (phrasal verbs, idioms, expressions)
+// ════════════════════════════════════════════════════════════
+function PhrasesTab({ ctx }) {
+  const phrases = ctx.data.phrases || [];
+  const [search, setSearch] = useState("");
+  const [filterType, setFilterType] = useState("all");
+  const [direction, setDirection] = useState("en-pl");
+  const [editing, setEditing] = useState(null);
+  const [showAdd, setShowAdd] = useState(false);
+  const [flipped, setFlipped] = useState({});
+  const [activeSession, setActiveSession] = useState(null);
+
+  if (activeSession) {
+    return <PhraseSession config={activeSession} ctx={ctx}
+      onDone={() => setActiveSession(null)}
+      onExit={() => setActiveSession(null)} />;
+  }
+
+  const filtered = phrases.filter(p => {
+    const q = search.toLowerCase();
+    const mq = !q || p.en.toLowerCase().includes(q) || p.pl.toLowerCase().includes(q);
+    const mt = filterType === "all" || p.type === filterType;
+    return mq && mt;
+  });
+
+  const canEdit = isAdmin(ctx.currentUser) || isTeacher(ctx.currentUser);
+
+  function toggleFlip(id) { setFlipped(f => ({ ...f, [id]: !f[id] })); }
+
+  return (
+    <div style={S.col(14)}>
+      <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 24, letterSpacing: -0.5 }}>Zwroty</div>
+
+      {/* Direction + Practice */}
+      <div style={S.row({ gap: 8 })}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, flex: 1 }}>
+          {[["en-pl","🇬🇧→🇵🇱"],["pl-en","🇵🇱→🇬🇧"]].map(([v,l]) => (
+            <button key={v} onClick={() => setDirection(v)}
+              style={{ background: direction===v?`${T.acc}12`:T.s2, border:`1.5px solid ${direction===v?T.acc:T.b1}`, borderRadius:T.r, padding:"8px", cursor:"pointer", fontSize:13, color:direction===v?T.acc:T.tx2 }}>
+              {l}
+            </button>
+          ))}
+        </div>
+        <button onClick={() => setActiveSession({ phrases: shuffle([...filtered]).slice(0,20), direction })}
+          style={{ ...S.btn("primary", true), whiteSpace:"nowrap" }} disabled={!filtered.length}>
+          ▶ Ćwicz ({filtered.length})
+        </button>
+      </div>
+
+      {/* Toolbar */}
+      <div style={S.row({ gap: 8 })}>
+        <input style={{ ...S.input(), flex: 1 }} value={search} onChange={e => setSearch(e.target.value)} placeholder="🔍  Szukaj zwrotów…" />
+        <select value={filterType} onChange={e => setFilterType(e.target.value)} style={{ ...S.input(), width: "auto", cursor: "pointer" }}>
+          <option value="all">Wszystkie typy</option>
+          <option value="phrasal_verb">Phrasal verbs</option>
+          <option value="idiom">Idiomy</option>
+          <option value="expression">Wyrażenia</option>
+          <option value="proverb">Przysłowia</option>
+        </select>
+        {canEdit && <button style={S.btn("ghost", true)} onClick={() => setShowAdd(true)}>+ Dodaj</button>}
+      </div>
+
+      <div style={{ fontSize: 12, color: T.tx3 }}>{filtered.length} zwrotów</div>
+
+      {/* Phrase cards */}
+      <div style={S.col(8)}>
+        {filtered.map(p => {
+          const meta = PHRASE_TYPES[p.type] || PHRASE_TYPES.expression;
+          const isFlipped = flipped[p.id];
+          const front = direction === "en-pl" ? p.en : p.pl;
+          const back  = direction === "en-pl" ? p.pl : p.en;
+          const exFront = direction === "en-pl" ? p.example    : p.example_pl;
+          const exBack  = direction === "en-pl" ? p.example_pl : p.example;
+
+          return (
+            <div key={p.id} style={{ ...S.card({ cursor: "pointer", transition: "border-color .15s", borderColor: isFlipped ? T.acc2 : T.b1 }), userSelect: "none" }}
+              onClick={() => toggleFlip(p.id)}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                    <span style={S.badge(meta.color, { fontSize: 10 })}>{meta.label}</span>
+                    {!isFlipped && <span style={{ fontSize: 10, color: T.tx3 }}>Dotknij aby odkryć</span>}
+                  </div>
+                  <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 16, fontWeight: 600, color: isFlipped ? T.tx2 : T.tx }}>{front}</div>
+                  {isFlipped && (
+                    <>
+                      <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 18, color: T.acc, marginTop: 8 }}>{back}</div>
+                      {exFront && <div style={{ fontSize: 12, color: T.tx3, marginTop: 8, fontStyle: "italic" }}>„{exFront}"</div>}
+                      {exBack  && <div style={{ fontSize: 12, color: T.tx2, marginTop: 2 }}>{exBack}</div>}
+                    </>
+                  )}
+                </div>
+                {canEdit && (
+                  <div style={S.col(4, { flexShrink: 0 })} onClick={e => e.stopPropagation()}>
+                    <button onClick={() => setEditing({ ...p })} style={{ background: "none", border: "none", color: T.tx3, cursor: "pointer", fontSize: 14 }}>✏️</button>
+                    <button onClick={() => { if (confirm("Usunąć?")) ctx.deletePhrase(p.id); }} style={{ background: "none", border: "none", color: T.tx3, cursor: "pointer", fontSize: 14 }}>🗑</button>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+        {filtered.length === 0 && (
+          <div style={{ textAlign: "center", color: T.tx3, fontSize: 13, padding: 32 }}>
+            {phrases.length === 0 ? "Brak zwrotów. Dodaj phrasal verbs, idiomy i wyrażenia." : "Brak pasujących zwrotów."}
+          </div>
+        )}
+      </div>
+
+      {editing && <EditPhraseModal phrase={editing} onSave={changes => { ctx.updatePhrase(editing.id, changes); setEditing(null); ctx.showToast("Zapisano"); }} onClose={() => setEditing(null)} />}
+      {showAdd && <AddPhraseModal onAdd={p => { ctx.addPhrases([p]); setShowAdd(false); }} onClose={() => setShowAdd(false)} />}
+    </div>
+  );
+}
+
+// ── Phrase flashcard session ──────────────────────────────────
+function PhraseSession({ config, ctx, onDone, onExit }) {
+  const { phrases, direction } = config;
+  const [queue] = useState(() => shuffle([...phrases]));
+  const [idx, setIdx] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+  const [stats, setStats] = useState({ knew: 0, didnt: 0 });
+
+  const current = queue[idx];
+  if (!current) { onDone(); return null; }
+
+  const front = direction === "en-pl" ? current.en : current.pl;
+  const back  = direction === "en-pl" ? current.pl : current.en;
+  const ex    = direction === "en-pl" ? current.example : current.example_pl;
+  const exTr  = direction === "en-pl" ? current.example_pl : current.example;
+  const meta  = PHRASE_TYPES[current.type] || PHRASE_TYPES.expression;
+  const progress = Math.round((idx / queue.length) * 100);
+
+  function respond(knew) {
+    setStats(s => ({ knew: s.knew+(knew?1:0), didnt: s.didnt+(knew?0:1) }));
+    if (idx + 1 >= queue.length) onDone();
+    else { setIdx(i=>i+1); setFlipped(false); }
+  }
+
+  return (
+    <div style={S.col(14)}>
+      <div style={S.row({ justifyContent: "space-between" })}>
+        <div style={S.col(2, { gap: 2 })}>
+          <div style={{ fontSize: 11, color: T.tx3, fontFamily: "'DM Mono',monospace", textTransform: "uppercase", letterSpacing: "1px" }}>Zwroty · {idx+1}/{queue.length}</div>
+          <div style={S.row({ gap: 8 })}>
+            <span style={{ fontSize: 11, color: T.green }}>✓ {stats.knew}</span>
+            <span style={{ fontSize: 11, color: T.red }}>✗ {stats.didnt}</span>
+          </div>
+        </div>
+        <button onClick={onExit} style={S.btn("ghost", true)}>✕</button>
+      </div>
+
+      <div style={{ height: 4, background: T.s3, borderRadius: 2, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${progress}%`, background: `linear-gradient(90deg,${T.acc2},${T.acc})`, borderRadius: 2, transition: "width .4s" }} />
+      </div>
+
+      <div onClick={() => !flipped && setFlipped(true)}
+        style={{ ...S.card({ cursor: flipped?"default":"pointer", minHeight: 180, border:`1px solid ${flipped?T.acc2:T.b1}`, transition:"all .2s" }),
+          display:"flex", flexDirection:"column", justifyContent:"center", alignItems:"center", textAlign:"center", gap:10, userSelect:"none" }}>
+        <span style={S.badge(meta.color, { fontSize: 10 })}>{meta.label}</span>
+        <div style={{ fontFamily:"'DM Mono',monospace", fontSize:"clamp(18px,4vw,28px)", fontWeight:600, color: flipped?T.tx2:T.tx }}>{front}</div>
+        {!flipped && <div style={{ fontSize:12, color:T.tx3 }}>Dotknij aby odkryć</div>}
+        {flipped && (
+          <div style={{ borderTop:`1px solid ${T.b1}`, paddingTop:12, width:"100%" }}>
+            <div style={{ fontFamily:"'DM Serif Display',serif", fontSize:"clamp(16px,4vw,24px)", color:T.acc }}>{back}</div>
+            {ex   && <div style={{ fontSize:12, color:T.tx3, marginTop:10, fontStyle:"italic" }}>„{ex}"</div>}
+            {exTr && <div style={{ fontSize:12, color:T.tx2, marginTop:2 }}>{exTr}</div>}
+          </div>
+        )}
+      </div>
+
+      {flipped ? (
+        <div style={S.col(10)}>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+            <button onClick={() => respond(false)} style={{ background:`${T.red}12`, border:`1.5px solid ${T.red}50`, borderRadius:T.r2, padding:"14px", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
+              <span style={{ fontSize:26 }}>😕</span><span style={{ fontSize:13, fontWeight:700, color:T.red }}>Nie wiedziałem</span>
+            </button>
+            <button onClick={() => respond(true)} style={{ background:`${T.green}12`, border:`1.5px solid ${T.green}50`, borderRadius:T.r2, padding:"14px", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
+              <span style={{ fontSize:26 }}>😊</span><span style={{ fontSize:13, fontWeight:700, color:T.green }}>Wiedziałem!</span>
+            </button>
+          </div>
+          <SynonymPanel word={current} ctx={ctx} />
+        </div>
+      ) : (
+        <button onClick={() => setFlipped(true)} style={{ ...S.btn("primary"), width:"100%", justifyContent:"center", padding:"14px" }}>Odkryj →</button>
+      )}
+    </div>
+  );
+}
+
+function EditPhraseModal({ phrase, onSave, onClose }) {
+  const [p, setP] = useState({ ...phrase });
+  return (
+    <Modal title="Edytuj zwrot" onClose={onClose}>
+      <div style={S.col(12)}>
+        <div><label style={S.label}>Angielski</label><input style={S.input()} value={p.en} onChange={e=>setP(x=>({...x,en:e.target.value}))}/></div>
+        <div><label style={S.label}>Polski</label><input style={S.input()} value={p.pl} onChange={e=>setP(x=>({...x,pl:e.target.value}))}/></div>
+        <div><label style={S.label}>Przykład EN</label><input style={S.input()} value={p.example||""} onChange={e=>setP(x=>({...x,example:e.target.value}))}/></div>
+        <div><label style={S.label}>Przykład PL</label><input style={S.input()} value={p.example_pl||""} onChange={e=>setP(x=>({...x,example_pl:e.target.value}))}/></div>
+        <div>
+          <label style={S.label}>Typ</label>
+          <select value={p.type||"expression"} onChange={e=>setP(x=>({...x,type:e.target.value}))} style={{...S.input(),cursor:"pointer"}}>
+            {Object.entries(PHRASE_TYPES).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+          </select>
+        </div>
+        <div style={S.row({ justifyContent:"flex-end" })}>
+          <button style={S.btn("ghost")} onClick={onClose}>Anuluj</button>
+          <button style={S.btn("primary")} onClick={()=>onSave(p)}>Zapisz</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function AddPhraseModal({ onAdd, onClose }) {
+  const [p, setP] = useState({ en:"", pl:"", example:"", example_pl:"", type:"phrasal_verb", category:"Zwroty" });
+  function save() {
+    if (!p.en.trim() || !p.pl.trim()) return;
+    onAdd({ ...p, en: p.en.trim(), pl: p.pl.trim() });
+    onClose();
+  }
+  return (
+    <Modal title="Dodaj zwrot" onClose={onClose}>
+      <div style={S.col(12)}>
+        <div>
+          <label style={S.label}>Typ</label>
+          <select value={p.type} onChange={e=>setP(x=>({...x,type:e.target.value}))} style={{...S.input(),cursor:"pointer"}}>
+            {Object.entries(PHRASE_TYPES).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+          </select>
+        </div>
+        <div><label style={S.label}>Angielski</label><input style={S.input()} value={p.en} onChange={e=>setP(x=>({...x,en:e.target.value}))} placeholder="break up" autoFocus/></div>
+        <div><label style={S.label}>Polski</label><input style={S.input()} value={p.pl} onChange={e=>setP(x=>({...x,pl:e.target.value}))} placeholder="rozstać się"/></div>
+        <div><label style={S.label}>Przykład EN (opcjonalnie)</label><input style={S.input()} value={p.example} onChange={e=>setP(x=>({...x,example:e.target.value}))} placeholder="They broke up after two years."/></div>
+        <div><label style={S.label}>Przykład PL (opcjonalnie)</label><input style={S.input()} value={p.example_pl} onChange={e=>setP(x=>({...x,example_pl:e.target.value}))} placeholder="Rozstali się po dwóch latach."/></div>
+        <button style={{...S.btn("primary"),width:"100%"}} onClick={save}>Dodaj zwrot</button>
+      </div>
+    </Modal>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  LIBRARY TAB
+// ════════════════════════════════════════════════════════════
+function LibraryTab({ ctx }) {
+  const { data, currentUser, getProgress } = ctx;
+  const [search, setSearch] = useState("");
+  const [filterCat, setFilterCat] = useState("all");
+  const [filterStatus, setFilterStatus] = useState("all");
+  const [editing, setEditing] = useState(null);
+  const [showAdd, setShowAdd] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [showScopeModal, setShowScopeModal] = useState(false);
+  const [expandSynonym, setExpandSynonym] = useState(null);
+
+  function getWordStatus(w) {
+    if (w.status === "pending") return { label: "Oczekuje", color: T.acc };
+    const p = getProgress(w.id);
+    if (p.score < 0) return { label: "Trudne", color: T.red };
+    if (p.score === 0 && !p.lastSeen) return { label: "Nowe", color: T.tx3 };
+    if (p.score >= 4) return { label: "Znam", color: T.green };
+    return { label: "Uczę się", color: T.acc2 };
+  }
+
+  const canEdit = isAdmin(currentUser) || isTeacher(currentUser);
+
+  const filtered = data.words.filter(w => {
+    const q = search.toLowerCase();
+    const mq = !q || w.en.toLowerCase().includes(q) || w.pl.toLowerCase().includes(q) || (w.category || "").toLowerCase().includes(q);
+    const mc = filterCat === "all" || w.category === filterCat;
+    const st = getWordStatus(w).label;
+    const ms = filterStatus === "all" || st === filterStatus;
+    return mq && mc && ms;
+  });
+
+  function toggleSelect(id) {
+    setSelectedIds(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id]);
+  }
+
+  function selectAll() { setSelectedIds(filtered.map(w => w.id)); }
+  function clearSelect() { setSelectedIds([]); }
+
+  return (
+    <div style={S.col(12)}>
+      <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 24, letterSpacing: -0.5 }}>Baza słów</div>
+
+      {/* Toolbar */}
+      <div style={S.col(8)}>
+        <input style={S.input()} value={search} onChange={e => setSearch(e.target.value)} placeholder="🔍  Szukaj…" />
+        <div style={S.row()}>
+          <select value={filterCat} onChange={e => setFilterCat(e.target.value)} style={{ ...S.input(), width: "auto", cursor: "pointer", flex: 1 }}>
+            <option value="all">Wszystkie kategorie</option>
+            {data.categories.map(c => <option key={c} value={c}>{c} ({data.words.filter(w => w.category === c).length})</option>)}
+          </select>
+          <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} style={{ ...S.input(), width: "auto", cursor: "pointer", flex: 1 }}>
+            {["all", "Nowe", "Oczekuje", "Uczę się", "Znam", "Trudne"].map(s => <option key={s} value={s}>{s === "all" ? "Wszystkie" : s}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* Actions bar */}
+      <div style={S.row({ justifyContent: "space-between" })}>
+        <div style={{ fontSize: 13, color: T.tx3 }}>{filtered.length} / {data.words.length} słów</div>
+        <div style={S.row({ gap: 6 })}>
+          {canEdit && <button style={S.btn("ghost", true)} onClick={() => setShowAdd(true)}>+ Dodaj</button>}
+          {canEdit && <button style={S.btn("ghost", true)} onClick={() => setShowImport(true)}>⬆ Import</button>}
+        </div>
+      </div>
+
+      {/* Selection bar */}
+      {selectedIds.length > 0 && (
+        <div style={S.card2({ background: `${T.acc}10`, border: `1px solid ${T.acc}`, display: "flex", justifyContent: "space-between", alignItems: "center" })}>
+          <div style={{ fontSize: 13, color: T.acc }}>Zaznaczono: {selectedIds.length}</div>
+          <div style={S.row({ gap: 6 })}>
+            <button style={S.btn("primary", true)} onClick={() => setShowScopeModal(true)}>Utwórz zakres testu</button>
+            <button style={S.btn("ghost", true)} onClick={clearSelect}>Odznacz</button>
+          </div>
+        </div>
+      )}
+
+      {/* Word list */}
+      <div style={S.col(4)}>
+        {/* Header row */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 4px" }}>
+          <input type="checkbox" checked={selectedIds.length === filtered.length && filtered.length > 0} onChange={e => e.target.checked ? selectAll() : clearSelect()} style={{ width: 16, height: 16, accentColor: T.acc }} />
+          <div style={{ fontSize: 10, color: T.tx3, fontFamily: "'DM Mono',monospace", textTransform: "uppercase", letterSpacing: "1px" }}>Zaznacz wszystkie</div>
+        </div>
+
+        {filtered.map(w => {
+          const st = getWordStatus(w);
+          const sel = selectedIds.includes(w.id);
+          return (
+            <div key={w.id} style={{ background: sel ? `${T.acc}08` : T.s1, border: `1px solid ${sel ? T.acc : T.b1}`, borderRadius: T.r, padding: "12px 14px", display: "flex", gap: 10, alignItems: "flex-start", transition: "all .1s" }}>
+              <input type="checkbox" checked={sel} onChange={() => toggleSelect(w.id)} style={{ width: 16, height: 16, marginTop: 2, accentColor: T.acc, flexShrink: 0 }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                  <div>
+                    <span style={{ fontFamily: "'DM Mono',monospace", fontWeight: 500, fontSize: 14 }}>{w.en}</span>
+                    {w.forms && <span style={{ fontSize: 11, color: T.tx3, fontFamily: "'DM Mono',monospace", marginLeft: 6 }}>({w.forms.past})</span>}
+                  </div>
+                  <span style={S.badge(st.color, { flexShrink: 0 })}>{st.label}</span>
+                </div>
+                <div style={{ fontSize: 13, color: T.tx2, marginTop: 2 }}>{w.pl}</div>
+                {w.category && <div style={{ ...S.badge(T.acc2, { marginTop: 5 }), fontSize: 10 }}>{w.category}</div>}
+              </div>
+              {canEdit && (
+                <div style={S.col(4, { flexShrink: 0 })}>
+                  <button onClick={() => setEditing({ ...w })} style={{ background: "none", border: "none", color: T.tx3, cursor: "pointer", fontSize: 14 }}>✏️</button>
+                  <button onClick={() => { if (confirm("Usunąć?")) ctx.deleteWord(w.id); }} style={{ background: "none", border: "none", color: T.tx3, cursor: "pointer", fontSize: 14 }}>🗑</button>
+                  {w.status === "pending" && <button onClick={() => ctx.updateWord(w.id, { status: "approved" })} style={{ background: "none", border: "none", color: T.green, cursor: "pointer", fontSize: 14 }}>✓</button>}
+                  <button onClick={() => setExpandSynonym(expandSynonym === w.id ? null : w.id)} style={{ background: "none", border: "none", color: T.acc2, cursor: "pointer", fontSize: 14 }} title="Synonimy">🔍</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {/* Inline synonym panel */}
+        {expandSynonym && (() => {
+          const w = filtered.find(x => x.id === expandSynonym);
+          return w ? <div key={"syn_"+w.id}><SynonymPanel word={w} ctx={ctx} autoOpen={true} /></div> : null;
+        })()}
+        {filtered.length === 0 && <div style={{ textAlign: "center", color: T.tx3, padding: 32, fontSize: 13 }}>Brak słów pasujących do filtrów</div>}
+      </div>
+
+      {/* Modals */}
+      {editing && <EditWordModal word={editing} categories={data.categories} onSave={changes => { ctx.updateWord(editing.id, changes); setEditing(null); ctx.showToast("Zapisano"); }} onClose={() => setEditing(null)} />}
+      {showAdd && <AddWordModal categories={data.categories} onAdd={words => { ctx.addWords(words); setShowAdd(false); }} onClose={() => setShowAdd(false)} />}
+      {showImport && <ImportModal categories={data.categories} onAdd={words => { ctx.addWords(words); setShowImport(false); }} onClose={() => setShowImport(false)} />}
+      {showScopeModal && <CreateScopeModal selectedIds={selectedIds} onSave={scope => { ctx.addTestScope(scope); setShowScopeModal(false); setSelectedIds([]); ctx.showToast("Zakres testu utworzony"); }} onClose={() => setShowScopeModal(false)} />}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  MANAGE TAB (Admin + Teacher)
+// ════════════════════════════════════════════════════════════
+function ManageTab({ ctx }) {
+  const { data, currentUser, exportData, importData } = ctx;
+  const [subTab, setSubTab] = useState("scopes");
+  const fileRef = useRef();
+
+  const pending = data.words.filter(w => w.status === "pending");
+
+  const subTabs = [
+    { id: "scopes", label: "Sprawdziany" },
+    { id: "pending", label: `Moderacja ${pending.length > 0 ? `(${pending.length})` : ""}` },
+    ...(isAdmin(currentUser) ? [{ id: "users", label: "Użytkownicy" }, { id: "api", label: "🔑 API" }, { id: "data", label: "Dane" }] : []),
+  ];
+
+  return (
+    <div style={S.col(14)}>
+      <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 24, letterSpacing: -0.5 }}>Zarządzanie</div>
+
+      {/* Sub-tabs */}
+      <div style={S.row({ gap: 6, flexWrap: "wrap" })}>
+        {subTabs.map(t => (
+          <button key={t.id} onClick={() => setSubTab(t.id)} style={S.btn(subTab === t.id ? "primary" : "ghost", true)}>{t.label}</button>
+        ))}
+      </div>
+
+      {subTab === "scopes" && <ScopesManager ctx={ctx} />}
+      {subTab === "pending" && <PendingModeration ctx={ctx} />}
+      {subTab === "users" && isAdmin(currentUser) && <UsersManager ctx={ctx} />}
+      {subTab === "api" && isAdmin(currentUser) && <ApiSettings ctx={ctx} />}
+      {subTab === "data" && isAdmin(currentUser) && (
+        <div style={S.col(12)}>
+          <div style={{ fontSize: 13, color: T.tx2 }}>Eksportuj lub importuj całą bazę danych. Użyj do backupu lub synchronizacji między urządzeniami.</div>
+          <button style={S.btn("primary")} onClick={exportData}>⬇ Eksportuj backup JSON</button>
+          <button style={S.btn("ghost")} onClick={() => fileRef.current.click()}>⬆ Importuj backup JSON</button>
+          <input ref={fileRef} type="file" accept=".json" style={{ display: "none" }} onChange={e => { const f = e.target.files[0]; if (!f) return; const r = new FileReader(); r.onload = ev => importData(ev.target.result); r.readAsText(f); }} />
+          <div style={{ fontSize: 11, color: T.tx3, lineHeight: 1.7 }}>
+            Baza: <strong style={{ color: T.tx }}>{data.words.length}</strong> słów · <strong style={{ color: T.tx }}>{data.categories.length}</strong> kategorii · <strong style={{ color: T.tx }}>{data.sessions.length}</strong> sesji
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  API SETTINGS
+// ════════════════════════════════════════════════════════════
+function ApiSettings({ ctx }) {
+  const userId = ctx?.currentUser?.id;
+  const [key, setKey] = useState(() => getGeminiKey(userId));
+  const [show, setShow] = useState(false);
+  const [status, setStatus] = useState(null);
+  const [errorMsg, setErrorMsg] = useState("");
+
+  async function verify() {
+    if (!key.trim()) return;
+    setStatus("checking");
+    setErrorMsg("");
+    const result = await verifyGeminiKey(key.trim());
+    if (result.ok) {
+      setGeminiKey(key.trim(), userId);
+      setStatus("ok");
+    } else {
+      setStatus("error");
+      setErrorMsg(result.error);
+    }
+  }
+
+  function save() {
+    setGeminiKey(key.trim(), userId);
+    setStatus(null);
+  }
+
+  function clear() {
+    setKey("");
+    setGeminiKey("", userId);
+    setStatus(null);
+  }
+
+  const savedKey = getGeminiKey(userId);
+
+  return (
+    <div style={S.col(14)}>
+      {/* Status banner */}
+      <div style={S.card2({
+        background: savedKey ? `${T.green}10` : `${T.acc}10`,
+        border: `1px solid ${savedKey ? T.green : T.acc}`,
+      })}>
+        <div style={S.row({ gap: 10 })}>
+          <span style={{ fontSize: 22 }}>{savedKey ? "✅" : "⚠️"}</span>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 14, color: savedKey ? T.green : T.acc }}>
+              {savedKey ? "Gemini AI aktywny" : "Brak klucza API"}
+            </div>
+            <div style={{ fontSize: 12, color: T.tx2, marginTop: 2 }}>
+              {savedKey
+                ? "Odpowiedzi oceniane przez AI — tolerancja form, synonimów i literówek."
+                : "Bez klucza działa tryb lokalny — dopasowanie tekstowe z tolerancją literówek."}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* How to get key */}
+      <div style={S.card()}>
+        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Jak uzyskać klucz Gemini Flash?</div>
+        <div style={{ fontSize: 12, color: T.tx2, lineHeight: 1.9 }}>
+          1. Wejdź na <span style={{ color: T.acc, fontFamily: "'DM Mono',monospace" }}>aistudio.google.com</span><br/>
+          2. Kliknij <strong>"Get API key"</strong> → <strong>"Create API key"</strong><br/>
+          3. Skopiuj klucz (zaczyna się od <span style={{ fontFamily: "'DM Mono',monospace", color: T.acc2 }}>AIzaSy…</span>)<br/>
+          4. Wklej poniżej i kliknij <strong>"Zweryfikuj i zapisz"</strong>
+        </div>
+        <div style={{ marginTop: 10, padding: "8px 12px", background: T.s3, borderRadius: 8, fontSize: 11, color: T.tx3, fontFamily: "'DM Mono',monospace", lineHeight: 1.7 }}>
+          Darmowy limit: 1500 req/dzień · 15 req/min<br/>
+          Klucz przechowywany lokalnie w przeglądarce.<br/>
+          Nigdzie nie wysyłany poza zapytaniami do Google.
+        </div>
+      </div>
+
+      {/* Key input */}
+      <div>
+        <label style={S.label}>Klucz API Gemini</label>
+        <div style={S.row({ gap: 8 })}>
+          <input
+            style={{ ...S.input(), flex: 1, fontFamily: "'DM Mono',monospace", letterSpacing: show ? 0 : 2 }}
+            type={show ? "text" : "password"}
+            value={key}
+            onChange={e => { setKey(e.target.value); setStatus(null); }}
+            placeholder="AIzaSy…"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <button style={S.btn("ghost", true)} onClick={() => setShow(s => !s)}>
+            {show ? "🙈" : "👁"}
+          </button>
+        </div>
+      </div>
+
+      {/* Verify status */}
+      {status === "checking" && (
+        <div style={S.row({ gap: 8, color: T.tx3, fontSize: 13 })}>
+          <div style={{ width: 14, height: 14, border: `2px solid ${T.b2}`, borderTopColor: T.acc2, borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+          Weryfikuję klucz…
+        </div>
+      )}
+      {status === "ok" && (
+        <div style={{ fontSize: 13, color: T.green }}>✓ Klucz poprawny — zapisano!</div>
+      )}
+      {status === "error" && (
+        <div style={S.col(4)}>
+          <div style={{ fontSize: 13, color: T.red }}>✗ Błąd: {errorMsg}</div>
+          <div style={{ fontSize: 11, color: T.tx3 }}>Sprawdź czy klucz jest poprawny i czy masz dostęp do Gemini API.</div>
+        </div>
+      )}
+
+      {/* Action buttons */}
+      <div style={S.row({ gap: 8 })}>
+        <button style={S.btn("primary")} onClick={verify} disabled={!key.trim() || status === "checking"}>
+          {status === "checking" ? "Sprawdzam…" : "✓ Zweryfikuj i zapisz"}
+        </button>
+        {savedKey && (
+          <button style={S.btn("danger")} onClick={clear}>Usuń klucz</button>
+        )}
+      </div>
+
+      {/* How evaluation works */}
+      <div style={S.card()}>
+        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>Jak działa ocena odpowiedzi?</div>
+        <div style={S.col(8)}>
+          {[
+            { icon: "⚡", label: "Tryb lokalny (zawsze)", desc: "Dopasowanie tekstu, tolerancja diakrytyków i 1-2 literówek, rozpoznawanie form czasownika. Działa offline.", color: T.acc2 },
+            { icon: "🤖", label: "Tryb AI (z kluczem)", desc: "Gemini ocenia semantycznie — widzę = widzieć ✓, synonimy, różne formy gramatyczne, feedback po polsku.", color: T.purple },
+            { icon: "≈", label: "Ocena częściowa", desc: "Odpowiedź akceptowana ale nieprecyzyjna — 70% XP. Słowo wraca do powtórki.", color: T.acc },
+          ].map(x => (
+            <div key={x.label} style={S.row({ gap: 10, alignItems: "flex-start" })}>
+              <span style={{ fontSize: 20, width: 28, textAlign: "center", flexShrink: 0 }}>{x.icon}</span>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: x.color }}>{x.label}</div>
+                <div style={{ fontSize: 12, color: T.tx2, marginTop: 2 }}>{x.desc}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ScopesManager({ ctx }) {
+  const { data } = ctx;
+  const [showCreate, setShowCreate] = useState(false);
+
+  return (
+    <div style={S.col(10)}>
+      <div style={S.row({ justifyContent: "space-between" })}>
+        <div style={{ fontSize: 13, color: T.tx3 }}>{data.testScopes.length} zakresów</div>
+        <button style={S.btn("primary", true)} onClick={() => setShowCreate(true)}>+ Nowy zakres</button>
+      </div>
+
+      {data.testScopes.length === 0 && <div style={{ color: T.tx3, fontSize: 13, textAlign: "center", padding: 24 }}>Brak zakresów. Utwórz zakres testu z listy słów lub tutaj.</div>}
+
+      {data.testScopes.map(s => (
+        <div key={s.id} style={S.card()}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 15 }}>{s.name}</div>
+              <div style={{ fontSize: 12, color: T.tx3, marginTop: 3 }}>{s.wordIds.length} słów{s.dueDate ? ` · sprawdzian: ${new Date(s.dueDate).toLocaleDateString("pl")}` : ""}</div>
+            </div>
+            <span style={S.badge(s.status === "active" ? T.green : s.status === "done" ? T.tx3 : T.acc)}>{s.status === "active" ? "Aktywny" : s.status === "done" ? "Zakończony" : "Szkic"}</span>
+          </div>
+          <div style={{ ...S.row({ gap: 6, marginTop: 12 }) }}>
+            <button style={S.btn("ghost", true)} onClick={() => ctx.updateTestScope(s.id, { status: s.status === "active" ? "draft" : "active" })}>
+              {s.status === "active" ? "Dezaktywuj" : "Aktywuj"}
+            </button>
+            <button style={S.btn("danger", true)} onClick={() => { if (confirm("Usunąć?")) ctx.deleteTestScope(s.id); }}>Usuń</button>
+          </div>
+        </div>
+      ))}
+
+      {showCreate && <CreateScopeModal selectedIds={[]} allWords={data.words} categories={data.categories} onSave={scope => { ctx.addTestScope(scope); setShowCreate(false); ctx.showToast("Zakres utworzony"); }} onClose={() => setShowCreate(false)} />}
+    </div>
+  );
+}
+
+function PendingModeration({ ctx }) {
+  const pending = ctx.data.words.filter(w => w.status === "pending");
+  if (!pending.length) return <div style={{ color: T.tx3, fontSize: 13, textAlign: "center", padding: 24 }}>✓ Wszystkie słowa zatwierdzone</div>;
+
+  return (
+    <div style={S.col(8)}>
+      <div style={{ fontSize: 13, color: T.tx2 }}>{pending.length} słów czeka na zatwierdzenie</div>
+      {pending.map(w => (
+        <div key={w.id} style={S.card()}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+            <div>
+              <div style={{ fontFamily: "'DM Mono',monospace", fontWeight: 500 }}>{w.en} <span style={{ color: T.tx3 }}>→</span> {w.pl}</div>
+              {w.forms && <div style={{ fontSize: 12, color: T.tx3, fontFamily: "'DM Mono',monospace", marginTop: 2 }}>{w.forms.past} · {w.forms.pp}</div>}
+              <div style={{ ...S.badge(T.acc2, { marginTop: 6 }), fontSize: 10 }}>{w.category}</div>
+            </div>
+            <div style={S.row({ gap: 6 })}>
+              <button style={S.btn("success", true)} onClick={() => ctx.updateWord(w.id, { status: "approved" })}>✓ Zatwierdź</button>
+              <button style={S.btn("danger", true)} onClick={() => ctx.deleteWord(w.id)}>✕ Odrzuć</button>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function UsersManager({ ctx }) {
+  const { data, currentUser } = ctx;
+  const [showAdd, setShowAdd] = useState(false);
+
+  return (
+    <div style={S.col(10)}>
+      <div style={S.row({ justifyContent: "space-between" })}>
+        <div style={{ fontSize: 13, color: T.tx3 }}>{data.users.length} użytkowników</div>
+        <button style={S.btn("primary", true)} onClick={() => setShowAdd(true)}>+ Dodaj użytkownika</button>
+      </div>
+
+      {data.users.map(u => (
+        <div key={u.id} style={S.card({ border: `1px solid ${u.id === currentUser.id ? T.acc : T.b1}` })}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 15 }}>{u.name} {u.id === currentUser.id && <span style={{ fontSize: 11, color: T.acc }}>(Ty)</span>}</div>
+              <div style={S.row({ gap: 4, marginTop: 5 })}>
+                {u.roles.map(r => <span key={r} style={S.badge(ROLE_META[r].color, { fontSize: 10 })}>{ROLE_META[r].icon} {ROLE_META[r].label}</span>)}
+              </div>
+              <div style={{ fontSize: 11, color: T.tx3, marginTop: 5, fontFamily: "'DM Mono',monospace" }}>XP: {u.xp || 0} · Seria: {u.streak || 0} dni</div>
+            </div>
+            {u.id !== currentUser.id && (
+              <button style={S.btn("danger", true)} onClick={() => { if (confirm(`Usunąć ${u.name}?`)) ctx.deleteUser(u.id); }}>Usuń</button>
+            )}
+          </div>
+        </div>
+      ))}
+
+      {showAdd && <AddUserModal onAdd={profile => { ctx.addUser(profile); setShowAdd(false); }} onClose={() => setShowAdd(false)} />}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  MODALS
+// ════════════════════════════════════════════════════════════
+function Modal({ title, onClose, children }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", zIndex: 500, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={{ background: T.s1, border: `1px solid ${T.b2}`, borderRadius: `${T.r3} ${T.r3} 0 0`, padding: "24px 20px 32px", width: "100%", maxWidth: 480, maxHeight: "90vh", overflowY: "auto", animation: "fadeUp .25s ease" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+          <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 20 }}>{title}</div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.tx2, cursor: "pointer", fontSize: 20, lineHeight: 1 }}>✕</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function EditWordModal({ word, categories, onSave, onClose }) {
+  const [w, setW] = useState({ ...word });
+  const hasForms = !!w.forms;
+  return (
+    <Modal title="Edytuj słowo" onClose={onClose}>
+      <div style={S.col(12)}>
+        <div><label style={S.label}>Angielski</label><input style={S.input()} value={w.en} onChange={e => setW(x => ({ ...x, en: e.target.value }))} /></div>
+        <div><label style={S.label}>Polski</label><input style={S.input()} value={w.pl} onChange={e => setW(x => ({ ...x, pl: e.target.value }))} /></div>
+        <div>
+          <label style={S.label}>Kategoria</label>
+          <select value={w.category || ""} onChange={e => setW(x => ({ ...x, category: e.target.value }))} style={{ ...S.input(), cursor: "pointer" }}>
+            {categories.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </div>
+        <div style={S.row()}>
+          <label style={{ ...S.label, marginBottom: 0 }}>Formy czasownika</label>
+          <input type="checkbox" checked={hasForms} onChange={e => setW(x => ({ ...x, forms: e.target.checked ? { past: "", pp: "" } : null }))} style={{ accentColor: T.acc }} />
+        </div>
+        {hasForms && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            <div><label style={S.label}>Past</label><input style={S.input()} value={w.forms.past} onChange={e => setW(x => ({ ...x, forms: { ...x.forms, past: e.target.value } }))} /></div>
+            <div><label style={S.label}>Past Participle</label><input style={S.input()} value={w.forms.pp} onChange={e => setW(x => ({ ...x, forms: { ...x.forms, pp: e.target.value } }))} /></div>
+          </div>
+        )}
+        <div><label style={S.label}>Status</label>
+          <select value={w.status} onChange={e => setW(x => ({ ...x, status: e.target.value }))} style={{ ...S.input(), cursor: "pointer" }}>
+            {["pending", "approved", "flagged"].map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+        <div style={S.row({ justifyContent: "flex-end" })}>
+          <button style={S.btn("ghost")} onClick={onClose}>Anuluj</button>
+          <button style={S.btn("primary")} onClick={() => onSave(w)}>Zapisz</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function AddWordModal({ categories, onAdd, onClose }) {
+  const [form, setForm] = useState({ en: "", pl: "", category: categories[0] || "", hasForms: false, past: "", pp: "", newCat: "" });
+  function save() {
+    if (!form.en.trim() || !form.pl.trim()) return;
+    const cat = form.newCat.trim() || form.category;
+    onAdd([{ en: form.en.trim().toLowerCase(), pl: form.pl.trim(), category: cat, forms: form.hasForms && form.past && form.pp ? { past: form.past, pp: form.pp } : null, language: "en-pl", status: "approved", source: "manual" }]);
+    onClose();
+  }
+  return (
+    <Modal title="Dodaj słowo" onClose={onClose}>
+      <div style={S.col(12)}>
+        <div><label style={S.label}>Angielski</label><input style={S.input()} value={form.en} onChange={e => setForm(f => ({ ...f, en: e.target.value }))} autoFocus /></div>
+        <div><label style={S.label}>Polski</label><input style={S.input()} value={form.pl} onChange={e => setForm(f => ({ ...f, pl: e.target.value }))} /></div>
+        <div>
+          <label style={S.label}>Kategoria</label>
+          <select value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))} style={{ ...S.input(), cursor: "pointer" }}>
+            {categories.map(c => <option key={c}>{c}</option>)}
+          </select>
+        </div>
+        <div><label style={S.label}>Lub nowa kategoria</label><input style={S.input()} value={form.newCat} onChange={e => setForm(f => ({ ...f, newCat: e.target.value }))} placeholder="Wpisz nową…" /></div>
+        <div style={S.row()}>
+          <label style={{ ...S.label, marginBottom: 0 }}>Czasownik (dodaj formy)</label>
+          <input type="checkbox" checked={form.hasForms} onChange={e => setForm(f => ({ ...f, hasForms: e.target.checked }))} style={{ accentColor: T.acc }} />
+        </div>
+        {form.hasForms && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            <div><label style={S.label}>Past</label><input style={S.input()} value={form.past} onChange={e => setForm(f => ({ ...f, past: e.target.value }))} /></div>
+            <div><label style={S.label}>Past Participle</label><input style={S.input()} value={form.pp} onChange={e => setForm(f => ({ ...f, pp: e.target.value }))} /></div>
+          </div>
+        )}
+        <button style={{ ...S.btn("primary"), width: "100%" }} onClick={save}>Dodaj słowo</button>
+      </div>
+    </Modal>
+  );
+}
+
+function ImportModal({ categories, onAdd, onClose }) {
+  const [csvText, setCsvText] = useState("");
+  const [catName, setCatName] = useState(categories[0] || "");
+  const [newCat, setNewCat] = useState("");
+  function doImport() {
+    const cat = newCat.trim() || catName;
+    const lines = csvText.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
+    const words = [];
+    lines.forEach(line => {
+      const p = line.split(",").map(s => s.trim().replace(/^"|"$/g, ""));
+      if (p.length < 2) return;
+      const [en, pl, past, pp] = p;
+      if (!en || !pl) return;
+      words.push({ en: en.toLowerCase(), pl, category: cat, forms: past && pp ? { past, pp } : null, language: "en-pl", status: "approved", source: "import" });
+    });
+    onAdd(words);
+    onClose();
+  }
+  return (
+    <Modal title="Import CSV" onClose={onClose}>
+      <div style={S.col(12)}>
+        <div style={{ fontSize: 12, color: T.tx3, lineHeight: 1.8, fontFamily: "'DM Mono',monospace" }}>
+          Format: <strong style={{ color: T.tx }}>angielski,polski,past,pp</strong><br />
+          Przykład: <strong style={{ color: T.acc }}>go,iść,went,gone</strong><br />
+          Zwykłe słowo: <strong style={{ color: T.acc }}>beautiful,piękny</strong>
+        </div>
+        <div>
+          <label style={S.label}>Kategoria</label>
+          <select value={catName} onChange={e => setCatName(e.target.value)} style={{ ...S.input(), cursor: "pointer" }}>
+            {categories.map(c => <option key={c}>{c}</option>)}
+          </select>
+        </div>
+        <div><label style={S.label}>Lub nowa kategoria</label><input style={S.input()} value={newCat} onChange={e => setNewCat(e.target.value)} placeholder="Wpisz…" /></div>
+        <textarea style={{ ...S.input(), minHeight: 160, resize: "vertical" }} value={csvText} onChange={e => setCsvText(e.target.value)} placeholder={"go,iść,went,gone\nbeautiful,piękny\nrun,biegać,ran,run"} />
+        <button style={{ ...S.btn("primary"), width: "100%" }} onClick={doImport}>Importuj</button>
+      </div>
+    </Modal>
+  );
+}
+
+function CreateScopeModal({ selectedIds, allWords, onSave, onClose }) {
+  const [name, setName] = useState("");
+  const [dueDate, setDueDate] = useState("");
+  return (
+    <Modal title="Utwórz zakres testu" onClose={onClose}>
+      <div style={S.col(12)}>
+        <div><label style={S.label}>Nazwa zakresu</label><input style={S.input()} value={name} onChange={e => setName(e.target.value)} placeholder="Np. Sprawdzian — rozdział 4" autoFocus /></div>
+        <div><label style={S.label}>Data sprawdzianu (opcjonalnie)</label><input style={S.input()} type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} /></div>
+        <div style={{ fontSize: 13, color: T.tx2 }}>Zaznaczonych słów: <strong style={{ color: T.acc }}>{selectedIds.length}</strong></div>
+        <button style={{ ...S.btn("primary"), width: "100%" }} onClick={() => { if (!name.trim()) return; onSave({ name: name.trim(), wordIds: selectedIds, dueDate: dueDate || null, status: "active" }); }} disabled={!name.trim()}>
+          Utwórz zakres
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function AddUserModal({ onAdd, onClose }) {
+  const [form, setForm] = useState({ name: "", pin: "", mode: "student" });
+  const MODES = [
+    { key: "student", roles: ["student"], label: "Uczeń" },
+    { key: "teacher", roles: ["teacher"], label: "Nauczyciel" },
+    { key: "admin", roles: ["admin", "teacher", "student"], label: "Administrator" },
+  ];
+  function save() {
+    if (!form.name.trim() || form.pin.length < 4) return;
+    const roles = MODES.find(m => m.key === form.mode)?.roles || ["student"];
+    onAdd({ name: form.name.trim(), pin: form.pin, roles });
+    onClose();
+  }
+  return (
+    <Modal title="Dodaj użytkownika" onClose={onClose}>
+      <div style={S.col(12)}>
+        <div><label style={S.label}>Imię / Nick</label><input style={S.input()} value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} autoFocus /></div>
+        <div><label style={S.label}>PIN (min. 4 cyfry)</label><input style={S.input()} type="password" inputMode="numeric" maxLength={8} value={form.pin} onChange={e => setForm(f => ({ ...f, pin: e.target.value.replace(/\D/g, "") }))} /></div>
+        <div>
+          <label style={S.label}>Rola</label>
+          <div style={S.col(6)}>
+            {MODES.map(m => (
+              <button key={m.key} onClick={() => setForm(f => ({ ...f, mode: m.key }))}
+                style={{ background: form.mode === m.key ? `${T.acc}15` : T.s2, border: `1.5px solid ${form.mode === m.key ? T.acc : T.b1}`, borderRadius: T.r, padding: "10px 14px", cursor: "pointer", textAlign: "left", display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: form.mode === m.key ? T.acc : T.tx, fontSize: 14 }}>{m.label}</span>
+                <div style={S.row({ gap: 4 })}>{m.roles.map(r => <span key={r} style={S.badge(ROLE_META[r].color, { fontSize: 10 })}>{ROLE_META[r].label}</span>)}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+        <button style={{ ...S.btn("primary"), width: "100%" }} onClick={save}>Dodaj użytkownika</button>
+      </div>
+    </Modal>
+  );
+}
+
+
+// Mount
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
