@@ -9,6 +9,7 @@ const APP_VERSION = "2.0.0";
 const STORAGE_KEY = "vl_data_v2";
 const STORAGE_KEY_V1 = "vl_data_v1";
 const GEMINI_KEY_STORAGE = "vl_gemini_key";
+const GROQ_KEY_STORAGE   = "vl_groq_key";
 
 // Motyw kolorystyczny
 const T = {
@@ -366,6 +367,62 @@ function setGeminiKey(key, userId) {
     else localStorage.removeItem(storKey);
   } catch {}
 }
+function getGroqKey(userId) {
+  try {
+    if (userId) {
+      const personal = localStorage.getItem(`${GROQ_KEY_STORAGE}__${userId}`);
+      if (personal) return personal;
+    }
+    return localStorage.getItem(GROQ_KEY_STORAGE) || "";
+  } catch { return ""; }
+}
+
+function setGroqKey(key, userId) {
+  try {
+    const k = (key || "").trim();
+    const storKey = userId ? `${GROQ_KEY_STORAGE}__${userId}` : GROQ_KEY_STORAGE;
+    if (k) localStorage.setItem(storKey, k);
+    else localStorage.removeItem(storKey);
+  } catch {}
+}
+
+async function groqRequest(key, prompt, maxTokens = 300) {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+    body: JSON.stringify({
+      model: "llama-3.1-8b-instant",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: maxTokens,
+      temperature: 0.1,
+    })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  return data?.choices?.[0]?.message?.content || "";
+}
+
+async function verifyGroqKey(key) {
+  try {
+    await groqRequest(key, "Say OK", 5);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// Wybierz AI: Groq priorytet (ocena/synonimy), Gemini fallback tylko tekst
+async function aiRequest(prompt, userId, maxTokens = 300) {
+  const groqKey = getGroqKey(userId);
+  if (groqKey) return groqRequest(groqKey, prompt, maxTokens);
+  const geminiKey = getGeminiKey(userId);
+  if (geminiKey) return geminiRequest(geminiKey, prompt, maxTokens);
+  throw new Error("Brak klucza AI");
+}
+
 
 async function geminiRequest(key, prompt, maxTokens = 300) {
   const res = await fetch(
@@ -398,8 +455,6 @@ async function verifyGeminiKey(key) {
 
 // Ocena odpowiedzi przez AI
 async function evaluateAnswer({ wordEN, wordPL, userAnswer, forms, formsAnswer, userId }) {
-  const key = getGeminiKey(userId);
-
   // Poziom 1: lokalny (zawsze)
   const localResult = localMatch(userAnswer, wordPL);
   let formsOk = true, formsDetail = "";
@@ -415,14 +470,15 @@ async function evaluateAnswer({ wordEN, wordPL, userAnswer, forms, formsAnswer, 
     return { quality:"full", feedback:"Idealna odpowiedź!", suggestion:wordPL, source:"local" };
   if (localResult === "typo" && formsOk)
     return { quality:"partial", feedback:"Literówka — prawie dobrze!", suggestion:wordPL, source:"local" };
-  if (!key) {
+  const hasAI = !!(getGroqKey(userId) || getGeminiKey(userId));
+  if (!hasAI) {
     if (localResult === "none")
       return { quality:"wrong", feedback:"Błędna odpowiedź.", suggestion:wordPL, source:"local",
         correctDisplay: wordPL + (forms ? ` · ${forms.past} · ${forms.pp}` : "") };
     return { quality:"partial", feedback:`Akceptowane, sprawdź: ${wordPL}`, suggestion:wordPL, source:"local" };
   }
 
-  // Poziom 2: AI
+  // Poziom 2: AI (Groq → Gemini fallback)
   try {
     const formsPrompt = forms
       ? `\nFormy (past/pp): "${forms.past}" / "${forms.pp}"\nOdpowiedź ucznia (past/pp): "${formsAnswer?.past||""}" / "${formsAnswer?.pp||""}"`
@@ -434,14 +490,14 @@ Odpowiedź ucznia: "${userAnswer}"
 Uwzględnij synonimy, formy gramatyczne, literówki.
 Odpowiedz TYLKO JSON:
 {"quality":"full"|"partial"|"wrong","feedback":"komentarz PL max 60 znaków","suggestion":"najlepsze tłumaczenie PL"}`;
-    const text = await geminiRequest(key, prompt, 200);
+    const text = await aiRequest(prompt, userId, 200);
     const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
     let q = parsed.quality;
     if (!formsOk && q === "full") q = "partial";
     return { quality:q, feedback:parsed.feedback||"", suggestion:parsed.suggestion||wordPL,
       source:"ai", formsDetail: formsDetail||undefined };
   } catch (e) {
-    console.warn("Gemini error:", e.message);
+    console.warn("AI error:", e.message);
     if (localResult === "none")
       return { quality:"wrong", feedback:`AI niedostępne. Poprawna: ${wordPL}`, suggestion:wordPL, source:"local-fallback",
         correctDisplay: wordPL + (forms ? ` · ${forms.past} · ${forms.pp}` : "") };
@@ -470,31 +526,25 @@ async function fetchDatamuseRelated(word) {
 async function lookupSynonyms(word, userId) {
   const related = await fetchDatamuseRelated(word);
   if (!related.length) return [];
-  const key = getGeminiKey(userId);
   let translations = {};
-  if (key) {
+  const hasAI = !!(getGroqKey(userId) || getGeminiKey(userId));
+  if (hasAI && related.length > 0) {
     try {
-      const prompt = `Przetłumacz na polski (TYLKO JSON {"en":"pl",...}): ${related.map(r=>r.word).join(", ")}`;
-      const text = await geminiRequest(key, prompt, 400);
+      const prompt = `Przetłumacz te angielskie słowa na polski. Odpowiedz TYLKO JSON {"słowo":"tłumaczenie",...}:\n${related.map(r=>r.word).join(",")}`;
+      const text = await aiRequest(prompt, userId, 400);
       translations = JSON.parse(text.replace(/```json|```/g,"").trim());
     } catch {}
   }
   return related.map(r => ({ word:r.word, pl:translations[r.word]||"", type:r.type }));
 }
 
-// AI reklasyfikacja tematu (placeholder — działa gdy jest klucz)
+// AI reklasyfikacja tematu
 async function classifyTopic(enWord, plWord, userId) {
-  const key = getGeminiKey(userId);
-  if (!key) return "unset";
+  const hasAI = !!(getGroqKey(userId) || getGeminiKey(userId));
+  if (!hasAI) return "unset";
   try {
-    const topicList = Object.entries(TOPICS)
-      .filter(([k]) => k !== "unset")
-      .map(([k,v]) => `${k}: ${v.label}`)
-      .join(", ");
-    const prompt = `Przypisz słowo "${enWord}" (${plWord}) do jednej kategorii tematycznej.
-Dostępne kategorie: ${topicList}
-Odpowiedz TYLKO kluczem kategorii, np: health`;
-    const text = await geminiRequest(key, prompt, 20);
+    const prompt = `Sklasyfikuj słowo angielskie "${enWord}" (PL: "${plWord}") do jednej z kategorii: ${Object.keys(TOPICS).join(",")}. Odpowiedz TYLKO nazwą kategorii.`;
+    const text = await aiRequest(prompt, userId, 20);
     const key2 = text.trim().toLowerCase().replace(/[^a-z_]/g,"");
     return TOPICS[key2] ? key2 : "unset";
   } catch { return "unset"; }
@@ -1098,20 +1148,74 @@ function AppShell({ ctx }) {
 }
 
 function ProfileDrawer({ user, onClose, onLogout }) {
-  const [key, setKey]     = useState(() => getGeminiKey(user.id));
-  const [show, setShow]   = useState(false);
-  const [status, setStatus] = useState(null);
-  const [errMsg, setErrMsg] = useState("");
-  const saved = getGeminiKey(user.id);
+  const [geminiKey, setGeminiKeyState] = useState(() => getGeminiKey(user.id));
+  const [groqKey, setGroqKeyState]     = useState(() => getGroqKey(user.id));
+  const [showGemini, setShowGemini]    = useState(false);
+  const [showGroq, setShowGroq]        = useState(false);
+  const [geminiStatus, setGeminiStatus] = useState(null);
+  const [groqStatus, setGroqStatus]     = useState(null);
+  const [geminiErr, setGeminiErr]       = useState("");
+  const [groqErr, setGroqErr]           = useState("");
 
-  async function verify() {
-    if (!key.trim()) return;
-    setStatus("checking"); setErrMsg("");
-    const r = await verifyGeminiKey(key.trim());
-    if (r.ok) { setGeminiKey(key.trim(), user.id); setStatus("ok"); }
-    else { setStatus("error"); setErrMsg(r.error); }
+  async function doVerifyGemini() {
+    if (!geminiKey.trim()) return;
+    setGeminiStatus("checking"); setGeminiErr("");
+    const r = await verifyGeminiKey(geminiKey.trim());
+    if (r.ok) { setGeminiKey(geminiKey.trim(), user.id); setGeminiStatus("ok"); }
+    else { setGeminiStatus("error"); setGeminiErr(r.error); }
   }
-  function clear() { setGeminiKey("",user.id); setKey(""); setStatus("cleared"); }
+  async function doVerifyGroq() {
+    if (!groqKey.trim()) return;
+    setGroqStatus("checking"); setGroqErr("");
+    const r = await verifyGroqKey(groqKey.trim());
+    if (r.ok) { setGroqKey(groqKey.trim(), user.id); setGroqStatus("ok"); }
+    else { setGroqStatus("error"); setGroqErr(r.error); }
+  }
+
+  function KeyBlock({ title, icon, desc, link, linkLabel, placeholder,
+    value, onChange, show, onToggle, status, errMsg, onVerify, onClear, saved, color }) {
+    return (
+      <div style={S.col(10)}>
+        <div style={{ fontSize:13, fontWeight:600, color:T.tx }}>{icon} {title}</div>
+        <div style={{ ...S.card2({ borderColor:saved?T.green:color }), background:saved?`${T.green}08`:`${color}08` }}>
+          <div style={S.row({ gap:10 })}>
+            <span style={{ fontSize:18 }}>{saved?"✅":"⚠️"}</span>
+            <div>
+              <div style={{ fontSize:13, fontWeight:600, color:saved?T.green:color }}>
+                {saved?"Aktywny":"Brak klucza"}
+              </div>
+              <div style={{ fontSize:11, color:T.tx2, marginTop:2 }}>{desc}</div>
+            </div>
+          </div>
+        </div>
+        <div style={{ fontSize:12, color:T.tx2, background:T.s2, borderRadius:T.r, padding:"10px 14px" }}>
+          Klucz z <span style={{ color, fontFamily:"'DM Mono',monospace" }}>{link}</span> → {linkLabel}
+        </div>
+        <div>
+          <label style={S.label}>Klucz API</label>
+          <div style={S.row({ gap:8 })}>
+            <input style={{ ...S.input(), flex:1, fontFamily:"'DM Mono',monospace", fontSize:12, letterSpacing:show?0:1 }}
+              type={show?"text":"password"} value={value}
+              onChange={e => onChange(e.target.value)}
+              placeholder={placeholder} autoComplete="off" spellCheck={false} />
+            <button style={S.btn("ghost",true)} onClick={onToggle}>{show?"🙈":"👁"}</button>
+          </div>
+        </div>
+        {status==="checking" && <div style={S.row({gap:8,color:T.tx3,fontSize:12})}>
+          <div style={{width:12,height:12,border:`2px solid ${T.b2}`,borderTopColor:color,borderRadius:"50%",animation:"spin 1s linear infinite"}} />Weryfikuję…</div>}
+        {status==="ok"      && <div style={{color:T.green,fontSize:12}}>✓ Klucz zapisany i działa</div>}
+        {status==="cleared" && <div style={{color:T.acc2,fontSize:12}}>Klucz usunięty</div>}
+        {status==="error"   && <div style={{color:T.red,fontSize:12,wordBreak:"break-all"}}>✗ {errMsg}</div>}
+        <div style={S.row({ gap:8 })}>
+          <button style={{ ...S.btn("primary"), flex:1, justifyContent:"center" }}
+            onClick={onVerify} disabled={!value.trim()||status==="checking"}>
+            {status==="checking"?"Sprawdzam…":"✓ Zweryfikuj i zapisz"}
+          </button>
+          {saved && <button style={S.btn("danger",true)} onClick={onClear}>Usuń</button>}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.7)", zIndex:500,
@@ -1131,48 +1235,35 @@ function ProfileDrawer({ user, onClose, onLogout }) {
           <button onClick={onClose} style={{ background:"none", border:"none", color:T.tx2, cursor:"pointer", fontSize:22 }}>✕</button>
         </div>
 
-        <div style={S.col(12)}>
-          <div style={{ fontSize:13, fontWeight:600, color:T.tx }}>🤖 Klucz Gemini AI</div>
-          <div style={{ ...S.card2({ borderColor:saved?T.green:T.acc }), background:saved?`${T.green}08`:`${T.acc}08` }}>
-            <div style={S.row({ gap:10 })}>
-              <span style={{ fontSize:20 }}>{saved?"✅":"⚠️"}</span>
-              <div>
-                <div style={{ fontSize:13, fontWeight:600, color:saved?T.green:T.acc }}>
-                  {saved?"AI aktywne":"Brak klucza — AI wyłączone"}
-                </div>
-                <div style={{ fontSize:11, color:T.tx2, marginTop:2 }}>
-                  {saved?"Ocena odpowiedzi, synonimy i klasyfikacja działają."
-                    :"Aplikacja działa lokalnie — bez oceny AI."}
-                </div>
-              </div>
-            </div>
-          </div>
-          <div style={{ fontSize:12, color:T.tx2, lineHeight:1.8, background:T.s2, borderRadius:T.r, padding:"10px 14px" }}>
-            Klucz z <span style={{ color:T.acc, fontFamily:"'DM Mono',monospace" }}>aistudio.google.com</span> → Get API key → Create API key
-          </div>
-          <div>
-            <label style={S.label}>Klucz API</label>
-            <div style={S.row({ gap:8 })}>
-              <input style={{ ...S.input(), flex:1, fontFamily:"'DM Mono',monospace", fontSize:12, letterSpacing:show?0:1 }}
-                type={show?"text":"password"} value={key}
-                onChange={e=>{setKey(e.target.value);setStatus(null);}}
-                placeholder="AIzaSy… lub AQ.…" autoComplete="off" spellCheck={false} />
-              <button style={S.btn("ghost",true)} onClick={() => setShow(s=>!s)}>{show?"🙈":"👁"}</button>
-            </div>
-          </div>
-          {status==="checking" && <div style={S.row({gap:8,color:T.tx3,fontSize:12})}>
-            <div style={{ width:12,height:12,border:`2px solid ${T.b2}`,borderTopColor:T.acc2,borderRadius:"50%",animation:"spin 1s linear infinite" }} />Weryfikuję…</div>}
-          {status==="ok"      && <div style={{color:T.green,fontSize:12}}>✓ Klucz zapisany i działa</div>}
-          {status==="cleared" && <div style={{color:T.acc2,fontSize:12}}>Klucz usunięty</div>}
-          {status==="error"   && <div style={{color:T.red,fontSize:12}}>✗ {errMsg}</div>}
-          <div style={S.row({ gap:8 })}>
-            <button style={{ ...S.btn("primary"), flex:1, justifyContent:"center" }}
-              onClick={verify} disabled={!key.trim()||status==="checking"}>
-              {status==="checking"?"Sprawdzam…":"✓ Zweryfikuj i zapisz"}
-            </button>
-            {saved && <button style={S.btn("danger",true)} onClick={clear}>Usuń</button>}
-          </div>
+        <div style={S.col(16)}>
+          <KeyBlock
+            title="Klucz Groq AI" icon="⚡"
+            desc={getGroqKey(user.id) ? "Ocena odpowiedzi i synonimy — 600 req/h darmowy" : "Darmowy, bez limitu dziennego — zalecany"}
+            link="console.groq.com" linkLabel="API Keys → Create"
+            placeholder="gsk_…"
+            value={groqKey} onChange={v=>{setGroqKeyState(v);setGroqStatus(null);}}
+            show={showGroq} onToggle={()=>setShowGroq(s=>!s)}
+            status={groqStatus} errMsg={groqErr}
+            onVerify={doVerifyGroq}
+            onClear={()=>{setGroqKey("",user.id);setGroqKeyState("");setGroqStatus("cleared");}}
+            saved={getGroqKey(user.id)} color={T.acc2} />
+
           <div style={{ height:1, background:T.b1 }} />
+
+          <KeyBlock
+            title="Klucz Gemini AI" icon="📸"
+            desc={getGeminiKey(user.id) ? "Skanowanie zdjęć podręcznika (vision)" : "Potrzebny TYLKO do importu ze zdjęć"}
+            link="aistudio.google.com" linkLabel="Get API key → Create"
+            placeholder="AIzaSy… lub AQ.…"
+            value={geminiKey} onChange={v=>{setGeminiKeyState(v);setGeminiStatus(null);}}
+            show={showGemini} onToggle={()=>setShowGemini(s=>!s)}
+            status={geminiStatus} errMsg={geminiErr}
+            onVerify={doVerifyGemini}
+            onClear={()=>{setGeminiKey("",user.id);setGeminiKeyState("");setGeminiStatus("cleared");}}
+            saved={getGeminiKey(user.id)} color={T.acc} />
+
+          <div style={{ height:1, background:T.b1 }} />
+
           <button onClick={() => { onLogout(); onClose(); }}
             style={{ ...S.btn("ghost"), width:"100%", justifyContent:"center", color:T.red, borderColor:`${T.red}40` }}>
             Wyloguj się
@@ -1182,6 +1273,7 @@ function ProfileDrawer({ user, onClose, onLogout }) {
     </div>
   );
 }
+
 
 // ════════════════════════════════════════════════════════════
 //  § 10. HOME TAB
