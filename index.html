@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -6,7 +7,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0d0c0b">
-<title>VocabLab v2.0</title>
+<title>VocabLab v2.1.0</title>
 <style>
 * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
 body { background:#0d0c0b; overscroll-behavior:none; }
@@ -19,7 +20,7 @@ body { background:#0d0c0b; overscroll-behavior:none; }
 </style>
 </head>
 <body>
-<div id="loading"><div>VocabLab</div><div class="sub">v2.0</div><div class="spin"></div></div>
+<div id="loading"><div>VocabLab</div><div class="sub">v2.1.0</div><div class="spin"></div></div>
 <div id="err"></div>
 <div id="root"></div>
 <script>
@@ -41,7 +42,7 @@ const { useState, useEffect, useRef, useCallback, useMemo } = React;
 //  Wersja, storage keys, motyw, tematy, typy gramatyczne
 // ════════════════════════════════════════════════════════════
 
-const APP_VERSION = "2.0.0";
+const APP_VERSION = "2.1.0";
 const STORAGE_KEY = "vl_data_v2";
 const STORAGE_KEY_V1 = "vl_data_v1";
 const GEMINI_KEY_STORAGE = "vl_gemini_key";
