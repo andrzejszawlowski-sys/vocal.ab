@@ -3,10 +3,9 @@
 <html lang="pl"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0d0c0b">
-<title>VocabLab v2.3.0</title>
+<title>VocabLab v2.4.0</title>
 <style>
 * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
 body { background:#0d0c0b; overscroll-behavior:none; }
@@ -18,13 +17,12 @@ body { background:#0d0c0b; overscroll-behavior:none; }
 #err { display:none;position:fixed;inset:0;background:#0d0c0b;color:#f05a5a;font-family:monospace;font-size:13px;padding:20px;overflow:auto;z-index:9999;white-space:pre-wrap; }
 </style></head>
 <body>
-<div id="loading"><div>VocabLab</div><div class="sub">v2.3.0</div><div class="spin"></div></div>
+<div id="loading"><div>VocabLab</div><div class="sub">v2.4.0</div><div class="spin"></div></div>
 <div id="err"></div><div id="root"></div>
 <script>
 window.addEventListener('error',function(e){
   document.getElementById('loading').style.display='none';
-  var d=document.getElementById('err');
-  d.style.display='block';
+  var d=document.getElementById('err');d.style.display='block';
   d.textContent='Błąd (linia '+e.lineno+'): '+e.message;
 });
 </script>
@@ -39,7 +37,7 @@ const { useState, useEffect, useRef, useCallback, useMemo } = React;
 //  Wersja, storage keys, motyw, tematy, typy gramatyczne
 // ════════════════════════════════════════════════════════════
 
-const APP_VERSION = "2.3.0";
+const APP_VERSION = "2.4.0";
 const STORAGE_KEY = "vl_data_v2";
 const STORAGE_KEY_V1 = "vl_data_v1";
 const GEMINI_KEY_STORAGE = "vl_gemini_key";
@@ -545,14 +543,19 @@ async function lookupSynonyms(word, pl, userId) {
   const hasAI = !!(getGroqKey(userId) || getGeminiKey(userId));
   if (!hasAI) return [];
   try {
-    const prompt = `Jesteś nauczycielem angielskiego. Podaj 6 synonimów angielskich dla słowa "${word}" w znaczeniu "${pl}".
-Wybierz tylko naturalne, popularne słowa na poziomie szkolnym (A2-B2).
-Odpowiedz TYLKO JSON, bez żadnego tekstu przed ani po:
-[{"en":"słowo","pl":"tłumaczenie PL","type":"synonim"}]`;
-    const text = await aiRequest(prompt, userId, 300);
+    const prompt = `Jesteś nauczycielem angielskiego dla polskich uczniów.
+Podaj dokładnie 5 PRAWDZIWYCH synonimów angielskich dla słowa "${word}" (znaczenie: "${pl}").
+ZASADY:
+- Tylko słowa które można zastąpić "${word}" w zdaniu bez zmiany sensu
+- Poziom A2-B2, naturalne słowa
+- NIE podawaj ogólnych czasowników jak "do", "have", "get", "be" chyba że są naprawdę synonimem
+- Każde słowo musi mieć polskie tłumaczenie
+Format TYLKO JSON, zero tekstu poza JSON:
+[{"en":"słowo","pl":"tłumaczenie"}]`;
+    const text = await aiRequest(prompt, userId, 250);
     const clean = text.replace(/```json|```/g,"").trim();
     const parsed = JSON.parse(clean);
-    return parsed.filter(x => x.en && x.pl);
+    return parsed.filter(x => x.en && x.pl && x.en.toLowerCase() !== word.toLowerCase());
   } catch(e) {
     console.warn("Synonyms error:", e.message);
     return [];
