@@ -7,7 +7,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0d0c0b">
-<title>VocabLab v1.2</title>
+<title>VocabLab v1.3</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   body { background: #0d0c0b; overscroll-behavior: none; }
@@ -28,7 +28,7 @@ window.addEventListener('error', function(e) {
   document.getElementById('loading').style.display = 'none';
   var d = document.getElementById('err');
   d.style.display = 'block';
-  d.innerHTML = '<h2 style="margin-bottom:12px">Błąd:</h2>' + e.message + '<br><br>Linia: ' + e.lineno + '<br><br>' + (e.filename||'');
+  d.innerHTML = '<h2 style="margin-bottom:12px">Błąd:</h2>' + e.message + '<br><br>Linia: ' + e.lineno;
 });
 </script>
 
@@ -36,8 +36,7 @@ window.addEventListener('error', function(e) {
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
 <script src="https://unpkg.com/@babel/standalone@7.23.10/babel.min.js"></script>
 
-<script type="text/babel" data-type="module">
-// Destructure hooks from global React
+<script type="text/babel">
 const { useState, useEffect, useRef, useCallback } = React;
 
 
@@ -698,6 +697,7 @@ function OnboardingScreen({ onDone }) {
       <div style={{ padding: "40px 24px 24px", textAlign: "center" }}>
         <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 36, color: T.acc, letterSpacing: -1, marginBottom: 6 }}>VocabLab</div>
         <div style={{ fontSize: 13, color: T.tx3 }}>Pierwsze uruchomienie — krok {step + 1} / 3</div>
+        <div style={{ fontSize: 11, color: T.tx3, fontFamily: "'DM Mono',monospace", marginTop: 4 }}>v1.3</div>
         {/* Step dots */}
         <div style={{ display: "flex", gap: 6, justifyContent: "center", marginTop: 10 }}>
           {[0,1,2].map(i => (
@@ -779,7 +779,7 @@ function OnboardingScreen({ onDone }) {
               Jak uzyskać klucz (bezpłatny):<br />
               1. Wejdź na <span style={{ color: T.acc, fontFamily: "'DM Mono',monospace" }}>aistudio.google.com</span><br />
               2. Kliknij <strong style={{ color: T.tx }}>Get API key → Create API key</strong><br />
-              3. Skopiuj klucz zaczynający się od <span style={{ fontFamily: "'DM Mono',monospace", color: T.acc2 }}>AQ. lub AIzaSy…</span>
+              3. Skopiuj klucz zaczynający się od <span style={{ fontFamily: "'DM Mono',monospace", color: T.acc2 }}>AIzaSy…</span>
             </div>
 
             {/* Input */}
@@ -788,7 +788,7 @@ function OnboardingScreen({ onDone }) {
               <div style={S.row({ gap: 8 })}>
                 <input style={{ ...S.input(), flex: 1, fontFamily: "'DM Mono',monospace", fontSize: 13 }}
                   value={form.geminiKey} onChange={e => { setForm(f => ({ ...f, geminiKey: e.target.value })); setKeyStatus(null); }}
-                  placeholder="Wklej klucz API…" autoComplete="off" spellCheck={false} />
+                  placeholder="AIzaSy…" autoComplete="off" spellCheck={false} />
                 {form.geminiKey.trim() && (
                   <button style={S.btn("ghost", true)} onClick={checkKey} disabled={keyStatus === "checking"}>
                     {keyStatus === "checking" ? "…" : "Sprawdź"}
@@ -888,7 +888,7 @@ function AppShell({ ctx }) {
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: "100vh" }}>
       {/* Top bar */}
       <div style={{ background: T.s1, borderBottom: `1px solid ${T.b1}`, padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
-        <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 19, color: T.acc, letterSpacing: -0.5 }}>VocabLab <span style={{fontSize:10, color:T.tx3, fontFamily:"'DM Mono',monospace", verticalAlign:"middle"}}>v1.2</span></div>
+        <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 19, color: T.acc, letterSpacing: -0.5 }}>VocabLab</div>
         <div style={S.row({ gap: 8 })}>
           {(isTeacher(currentUser) || isAdmin(currentUser)) && (
             <button onClick={() => setTab("manage")}
@@ -1010,7 +1010,7 @@ function ProfileDrawer({ user, onClose, onLogout }) {
                 type={show ? "text" : "password"}
                 value={key}
                 onChange={e => { setKey(e.target.value); setStatus(null); }}
-                placeholder="Wklej klucz API…"
+                placeholder="AIzaSy…"
                 autoComplete="off" spellCheck={false} />
               <button style={S.btn("ghost", true)} onClick={() => setShow(s => !s)}>{show ? "🙈" : "👁"}</button>
             </div>
@@ -2464,7 +2464,7 @@ function ApiSettings({ ctx }) {
         <div style={{ fontSize: 12, color: T.tx2, lineHeight: 1.9 }}>
           1. Wejdź na <span style={{ color: T.acc, fontFamily: "'DM Mono',monospace" }}>aistudio.google.com</span><br/>
           2. Kliknij <strong>"Get API key"</strong> → <strong>"Create API key"</strong><br/>
-          3. Skopiuj klucz (zaczyna się od <span style={{ fontFamily: "'DM Mono',monospace", color: T.acc2 }}>AQ. lub AIzaSy…</span>)<br/>
+          3. Skopiuj klucz (zaczyna się od <span style={{ fontFamily: "'DM Mono',monospace", color: T.acc2 }}>AIzaSy…</span>)<br/>
           4. Wklej poniżej i kliknij <strong>"Zweryfikuj i zapisz"</strong>
         </div>
         <div style={{ marginTop: 10, padding: "8px 12px", background: T.s3, borderRadius: 8, fontSize: 11, color: T.tx3, fontFamily: "'DM Mono',monospace", lineHeight: 1.7 }}>
@@ -2483,7 +2483,7 @@ function ApiSettings({ ctx }) {
             type={show ? "text" : "password"}
             value={key}
             onChange={e => { setKey(e.target.value); setStatus(null); }}
-            placeholder="Wklej klucz API…"
+            placeholder="AIzaSy…"
             autoComplete="off"
             spellCheck={false}
           />
@@ -2823,7 +2823,6 @@ function AddUserModal({ onAdd, onClose }) {
 }
 
 
-// Mount
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(React.createElement(App));
 document.getElementById('loading').style.display = 'none';
