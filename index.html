@@ -7,7 +7,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0d0c0b">
-<title>VocabLab</title>
+<title>VocabLab v1.2</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   body { background: #0d0c0b; overscroll-behavior: none; }
@@ -888,7 +888,7 @@ function AppShell({ ctx }) {
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: "100vh" }}>
       {/* Top bar */}
       <div style={{ background: T.s1, borderBottom: `1px solid ${T.b1}`, padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
-        <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 19, color: T.acc, letterSpacing: -0.5 }}>VocabLab</div>
+        <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 19, color: T.acc, letterSpacing: -0.5 }}>VocabLab <span style={{fontSize:10, color:T.tx3, fontFamily:"'DM Mono',monospace", verticalAlign:"middle"}}>v1.2</span></div>
         <div style={S.row({ gap: 8 })}>
           {(isTeacher(currentUser) || isAdmin(currentUser)) && (
             <button onClick={() => setTab("manage")}
