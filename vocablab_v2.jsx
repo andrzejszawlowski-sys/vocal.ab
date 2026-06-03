@@ -1052,7 +1052,7 @@ function AppShell({ ctx }) {
       </div>
 
       {/* Content */}
-      <div style={{ flex:1, overflowY:"auto", padding:"20px 16px 80px" }}>
+      <div style={{ flex:1, overflowY:"auto", padding:"20px 16px 110px" }}>
         {tab==="home"    && <HomeTab    ctx={ctx} />}
         {tab==="learn"   && <LearnTab   ctx={ctx} />}
         {tab==="library" && <LibraryTab ctx={ctx} />}
@@ -1061,19 +1061,35 @@ function AppShell({ ctx }) {
         {tab==="manage"  && <ManageTab  ctx={ctx} />}
       </div>
 
-      {/* Bottom nav */}
+      {/* Bottom nav — 2 rzędy */}
       <div style={{ position:"fixed", bottom:0, left:"50%", transform:"translateX(-50%)",
         width:"100%", maxWidth:480, background:T.s1, borderTop:`1px solid ${T.b1}`,
-        display:"flex", zIndex:100 }}>
-        {tabs.map(t => (
-          <button key={t.id} onClick={() => setTab(t.id)}
-            style={{ flex:1, background:"none", border:"none", padding:"10px 0 8px",
-              cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:3 }}>
-            <span style={{ fontSize:22 }}>{t.icon}</span>
-            <span style={{ fontSize:10, color:tab===t.id?T.acc:T.tx3, fontWeight:tab===t.id?600:400 }}>{t.label}</span>
-            {tab===t.id && <div style={{ width:20, height:2, background:T.acc, borderRadius:1 }} />}
-          </button>
-        ))}
+        zIndex:100 }}>
+        {/* Rząd 1: pierwsze 4 zakładki */}
+        <div style={{ display:"flex", borderBottom:`1px solid ${T.b1}` }}>
+          {tabs.slice(0,4).map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)}
+              style={{ flex:1, background:"none", border:"none", padding:"8px 0 5px",
+                cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:2 }}>
+              <span style={{ fontSize:20 }}>{t.icon}</span>
+              <span style={{ fontSize:9, color:tab===t.id?T.acc:T.tx3, fontWeight:tab===t.id?600:400 }}>{t.label}</span>
+              {tab===t.id && <div style={{ width:18, height:2, background:T.acc, borderRadius:1 }} />}
+            </button>
+          ))}
+        </div>
+        {/* Rząd 2: pozostałe zakładki */}
+        <div style={{ display:"flex" }}>
+          {tabs.slice(4).map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)}
+              style={{ flex:1, background:"none", border:"none", padding:"6px 0 8px",
+                cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:2,
+                maxWidth: 120 }}>
+              <span style={{ fontSize:18 }}>{t.icon}</span>
+              <span style={{ fontSize:9, color:tab===t.id?T.acc:T.tx3, fontWeight:tab===t.id?600:400 }}>{t.label}</span>
+              {tab===t.id && <div style={{ width:18, height:2, background:T.acc, borderRadius:1 }} />}
+            </button>
+          ))}
+        </div>
       </div>
 
       {showProfile && <ProfileDrawer user={currentUser} onClose={() => setShowProfile(false)} onLogout={logout} />}
