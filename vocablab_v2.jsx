@@ -1,48 +1,4 @@
-<!DOCTYPE html>
-<html lang="pl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#0d0c0b">
-<title>VocabLab v2.0</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-  body { background: #0d0c0b; overscroll-behavior: none; }
-  #root { min-height: 100vh; }
-  #loading { position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#0d0c0b;color:#f5c842;font-family:serif;font-size:32px;gap:16px;z-index:9999; }
-  #loading .sub { font-size:11px;color:#5c5a56;font-family:monospace; }
-  #loading .spin { width:32px;height:32px;border:3px solid #2a2826;border-top-color:#f5c842;border-radius:50%;animation:spin 1s linear infinite; }
-  @keyframes spin { to { transform:rotate(360deg); } }
-  #err { display:none;position:fixed;inset:0;background:#0d0c0b;color:#f05a5a;font-family:monospace;font-size:14px;padding:20px;overflow:auto;z-index:9999; }
-</style>
-</head>
-<body>
-<div id="loading">
-  <div>VocabLab</div>
-  <div class="sub">v2.0</div>
-  <div class="spin"></div>
-</div>
-<div id="err"></div>
-<div id="root"></div>
-
-<script>
-window.addEventListener('error', function(e) {
-  document.getElementById('loading').style.display = 'none';
-  var d = document.getElementById('err');
-  d.style.display = 'block';
-  d.innerHTML = '<h2 style="margin-bottom:12px">Błąd:</h2>' + e.message + '<br><br>Linia: ' + e.lineno;
-});
-</script>
-
-<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-<script src="https://unpkg.com/@babel/standalone@7.23.10/babel.min.js"></script>
-
-<script type="text/babel">
-const { useState, useEffect, useRef, useCallback, useMemo } = React;
-
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 // ════════════════════════════════════════════════════════════
 //  § 1. CONSTANTS
@@ -3053,11 +3009,3 @@ function AddUserModal({ onAdd, onClose }) {
     </Modal>
   );
 }
-
-
-const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(React.createElement(App));
-document.getElementById('loading').style.display = 'none';
-</script>
-</body>
-</html>
