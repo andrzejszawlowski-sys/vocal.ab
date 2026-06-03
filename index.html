@@ -7,7 +7,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0d0c0b">
-<title>VocabLab v2.1.0</title>
+<title>VocabLab v2.2.0</title>
 <style>
 * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
 body { background:#0d0c0b; overscroll-behavior:none; }
@@ -20,7 +20,7 @@ body { background:#0d0c0b; overscroll-behavior:none; }
 </style>
 </head>
 <body>
-<div id="loading"><div>VocabLab</div><div class="sub">v2.1.0</div><div class="spin"></div></div>
+<div id="loading"><div>VocabLab</div><div class="sub">v2.2.0</div><div class="spin"></div></div>
 <div id="err"></div>
 <div id="root"></div>
 <script>
@@ -42,7 +42,7 @@ const { useState, useEffect, useRef, useCallback, useMemo } = React;
 //  Wersja, storage keys, motyw, tematy, typy gramatyczne
 // ════════════════════════════════════════════════════════════
 
-const APP_VERSION = "2.1.0";
+const APP_VERSION = "2.2.0";
 const STORAGE_KEY = "vl_data_v2";
 const STORAGE_KEY_V1 = "vl_data_v1";
 const GEMINI_KEY_STORAGE = "vl_gemini_key";
@@ -1139,7 +1139,7 @@ function AppShell({ ctx }) {
       </div>
 
       {/* Content */}
-      <div style={{ flex:1, overflowY:"auto", padding:"20px 16px 110px" }}>
+      <div style={{ flex:1, overflowY:"auto", overflowX:"hidden", padding:"20px 16px 110px", WebkitOverflowScrolling:"touch" }}>
         {tab==="home"    && <HomeTab    ctx={ctx} />}
         {tab==="learn"   && <LearnTab   ctx={ctx} />}
         {tab==="library" && <LibraryTab ctx={ctx} />}
@@ -1259,19 +1259,27 @@ function ProfileDrawer({ user, onClose, onLogout }) {
       display:"flex", alignItems:"flex-end", justifyContent:"center" }}
       onClick={e => e.target===e.currentTarget && onClose()}>
       <div style={{ background:T.s1, border:`1px solid ${T.b2}`,
-        borderRadius:`${T.r3} ${T.r3} 0 0`, padding:"24px 20px 36px",
-        width:"100%", maxWidth:480, animation:"fadeUp .25s ease", maxHeight:"90vh", overflowY:"auto" }}>
+        borderRadius:`${T.r3} ${T.r3} 0 0`,
+        width:"100%", maxWidth:480, animation:"fadeUp .25s ease",
+        maxHeight:"85vh", display:"flex", flexDirection:"column" }}>
 
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
-          <div>
-            <div style={{ fontFamily:"'DM Serif Display',serif", fontSize:20 }}>Mój profil</div>
-            <div style={S.row({ gap:4, marginTop:4 })}>
-              {user.roles.map(r => <span key={r} style={S.badge(ROLE_META[r].color,{fontSize:10})}>{ROLE_META[r].icon} {ROLE_META[r].label}</span>)}
+        {/* Sticky header */}
+        <div style={{ padding:"20px 20px 12px", borderBottom:`1px solid ${T.b1}`, flexShrink:0 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <div>
+              <div style={{ fontFamily:"'DM Serif Display',serif", fontSize:20 }}>Mój profil</div>
+              <div style={S.row({ gap:4, marginTop:4 })}>
+                {user.roles.map(r => <span key={r} style={S.badge(ROLE_META[r].color,{fontSize:10})}>{ROLE_META[r].icon} {ROLE_META[r].label}</span>)}
+              </div>
             </div>
+            <button onClick={onClose} style={{ background:T.s2, border:`1px solid ${T.b2}`, borderRadius:"50%",
+              width:36, height:36, color:T.tx, cursor:"pointer", fontSize:16, display:"flex", alignItems:"center", justifyContent:"center" }}>✕</button>
           </div>
-          <button onClick={onClose} style={{ background:"none", border:"none", color:T.tx2, cursor:"pointer", fontSize:22 }}>✕</button>
         </div>
 
+        {/* Scrollable body */}
+        <div style={{ overflowY:"auto", overflowX:"hidden", WebkitOverflowScrolling:"touch",
+          padding:"20px 20px 36px", flex:1 }}>
         <div style={S.col(16)}>
           <KeyBlock
             title="Klucz Groq AI" icon="⚡"
@@ -1306,6 +1314,7 @@ function ProfileDrawer({ user, onClose, onLogout }) {
             Wyloguj się
           </button>
         </div>
+        </div>{/* end scrollable body */}
       </div>
     </div>
   );
@@ -3470,13 +3479,22 @@ function Modal({ title, onClose, children }) {
       display:"flex",alignItems:"flex-end",justifyContent:"center"}}
       onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div style={{background:T.s1,border:`1px solid ${T.b2}`,
-        borderRadius:`${T.r3} ${T.r3} 0 0`,padding:"24px 20px 32px",
-        width:"100%",maxWidth:480,maxHeight:"90vh",overflowY:"auto",animation:"fadeUp .25s ease"}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+        borderRadius:`${T.r3} ${T.r3} 0 0`,
+        width:"100%",maxWidth:480,maxHeight:"88vh",
+        display:"flex",flexDirection:"column",animation:"fadeUp .25s ease"}}>
+        {/* Sticky header */}
+        <div style={{padding:"18px 20px 14px",borderBottom:`1px solid ${T.b1}`,
+          display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
           <div style={{fontFamily:"'DM Serif Display',serif",fontSize:20}}>{title}</div>
-          <button onClick={onClose} style={{background:"none",border:"none",color:T.tx2,cursor:"pointer",fontSize:20,lineHeight:1}}>✕</button>
+          <button onClick={onClose} style={{background:T.s2,border:`1px solid ${T.b2}`,
+            borderRadius:"50%",width:34,height:34,color:T.tx,cursor:"pointer",
+            fontSize:15,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
         </div>
-        {children}
+        {/* Scrollable body */}
+        <div style={{overflowY:"auto",overflowX:"hidden",WebkitOverflowScrolling:"touch",
+          padding:"20px 20px 32px",flex:1}}>
+          {children}
+        </div>
       </div>
     </div>
   );
