@@ -1,13 +1,12 @@
 
 <!DOCTYPE html>
-<html lang="pl">
-<head>
+<html lang="pl"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0d0c0b">
-<title>VocabLab v2.2.0</title>
+<title>VocabLab v2.3.0</title>
 <style>
 * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
 body { background:#0d0c0b; overscroll-behavior:none; }
@@ -17,12 +16,10 @@ body { background:#0d0c0b; overscroll-behavior:none; }
 #loading .spin { width:32px;height:32px;border:3px solid #2a2826;border-top-color:#f5c842;border-radius:50%;animation:spin 1s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
 #err { display:none;position:fixed;inset:0;background:#0d0c0b;color:#f05a5a;font-family:monospace;font-size:13px;padding:20px;overflow:auto;z-index:9999;white-space:pre-wrap; }
-</style>
-</head>
+</style></head>
 <body>
-<div id="loading"><div>VocabLab</div><div class="sub">v2.2.0</div><div class="spin"></div></div>
-<div id="err"></div>
-<div id="root"></div>
+<div id="loading"><div>VocabLab</div><div class="sub">v2.3.0</div><div class="spin"></div></div>
+<div id="err"></div><div id="root"></div>
 <script>
 window.addEventListener('error',function(e){
   document.getElementById('loading').style.display='none';
@@ -42,7 +39,7 @@ const { useState, useEffect, useRef, useCallback, useMemo } = React;
 //  Wersja, storage keys, motyw, tematy, typy gramatyczne
 // ════════════════════════════════════════════════════════════
 
-const APP_VERSION = "2.2.0";
+const APP_VERSION = "2.3.0";
 const STORAGE_KEY = "vl_data_v2";
 const STORAGE_KEY_V1 = "vl_data_v1";
 const GEMINI_KEY_STORAGE = "vl_gemini_key";
@@ -544,35 +541,22 @@ Odpowiedz TYLKO JSON:
 }
 
 // Synonimy z Datamuse + tłumaczenia Gemini
-async function fetchDatamuseRelated(word) {
-  try {
-    const [syn, trg, mlt] = await Promise.all([
-      fetch(`https://api.datamuse.com/words?rel_syn=${encodeURIComponent(word)}&max=8`).then(r=>r.json()).catch(()=>[]),
-      fetch(`https://api.datamuse.com/words?rel_trg=${encodeURIComponent(word)}&max=6`).then(r=>r.json()).catch(()=>[]),
-      fetch(`https://api.datamuse.com/words?ml=${encodeURIComponent(word)}&max=6`).then(r=>r.json()).catch(()=>[]),
-    ]);
-    const seen = new Set([word]);
-    return [
-      ...syn.map(d=>({word:d.word, type:"synonym"})),
-      ...trg.map(d=>({word:d.word, type:"related"})),
-      ...mlt.map(d=>({word:d.word, type:"similar"})),
-    ].filter(x => { if(seen.has(x.word)) return false; seen.add(x.word); return true; }).slice(0,16);
-  } catch { return []; }
-}
-
-async function lookupSynonyms(word, userId) {
-  const related = await fetchDatamuseRelated(word);
-  if (!related.length) return [];
-  let translations = {};
+async function lookupSynonyms(word, pl, userId) {
   const hasAI = !!(getGroqKey(userId) || getGeminiKey(userId));
-  if (hasAI && related.length > 0) {
-    try {
-      const prompt = `Przetłumacz te angielskie słowa na polski. Odpowiedz TYLKO JSON {"słowo":"tłumaczenie",...}:\n${related.map(r=>r.word).join(",")}`;
-      const text = await aiRequest(prompt, userId, 400);
-      translations = JSON.parse(text.replace(/```json|```/g,"").trim());
-    } catch {}
+  if (!hasAI) return [];
+  try {
+    const prompt = `Jesteś nauczycielem angielskiego. Podaj 6 synonimów angielskich dla słowa "${word}" w znaczeniu "${pl}".
+Wybierz tylko naturalne, popularne słowa na poziomie szkolnym (A2-B2).
+Odpowiedz TYLKO JSON, bez żadnego tekstu przed ani po:
+[{"en":"słowo","pl":"tłumaczenie PL","type":"synonim"}]`;
+    const text = await aiRequest(prompt, userId, 300);
+    const clean = text.replace(/```json|```/g,"").trim();
+    const parsed = JSON.parse(clean);
+    return parsed.filter(x => x.en && x.pl);
+  } catch(e) {
+    console.warn("Synonyms error:", e.message);
+    return [];
   }
-  return related.map(r => ({ word:r.word, pl:translations[r.word]||"", type:r.type }));
 }
 
 // AI reklasyfikacja tematu
@@ -2084,16 +2068,16 @@ function SynonymPanel({ word, ctx, autoOpen=false }) {
   const [offline, setOffline] = useState(false);
 
   const userId = ctx.currentUser?.id;
-  const hasKey = !!getGeminiKey(userId);
+  const hasKey = !!(getGroqKey(userId) || getGeminiKey(userId));
 
   useEffect(() => { if(autoOpen) doLoad(); }, []);
 
   async function doLoad() {
     setLoading(true); setOffline(false);
     try {
-      const syns = await lookupSynonyms(word.en, userId);
+      const syns = await lookupSynonyms(word.en, word.pl, userId);
       setResults(syns);
-      if (!syns.length&&!navigator.onLine) setOffline(true);
+      if (!syns.length) setOffline(true);
     } catch { setOffline(true); }
     setLoading(false);
   }
@@ -2104,8 +2088,8 @@ function SynonymPanel({ word, ctx, autoOpen=false }) {
   }
 
   function addSelected() {
-    const toAdd = results.filter(r=>checked[r.word]).map(r => ({
-      en:r.word, pl:r.pl||"", grammarType:"other", topic:"unset",
+    const toAdd = results.filter(r=>checked[r.en]).map(r => ({
+      en:r.en, pl:r.pl||"", grammarType:"other", topic:"unset",
       forms:null, example:null, example_pl:null,
       status:"approved", source:"synonym",
     }));
@@ -2162,20 +2146,20 @@ function SynonymPanel({ word, ctx, autoOpen=false }) {
             <>
               <div style={S.col(6)}>
                 {results.map(r => {
-                  const alreadyIn = ctx.data.items.some(w=>norm(w.en)===norm(r.word));
+                  const alreadyIn = ctx.data.items.some(w=>norm(w.en)===norm(r.en));
                   return (
-                    <label key={r.word}
+                    <label key={r.en}
                       style={{display:"flex",alignItems:"center",gap:10,padding:"7px 10px",
-                        background:checked[r.word]?`${T.acc2}12`:T.s2,borderRadius:8,
+                        background:checked[r.en]?`${T.acc2}12`:T.s2,borderRadius:8,
                         cursor:alreadyIn?"default":"pointer",
-                        border:`1px solid ${checked[r.word]?T.acc2:T.b1}`,transition:"all .1s"}}>
-                      <input type="checkbox" checked={!!checked[r.word]} disabled={alreadyIn}
-                        onChange={() => !alreadyIn&&setChecked(c=>({...c,[r.word]:!c[r.word]}))}
+                        border:`1px solid ${checked[r.en]?T.acc2:T.b1}`,transition:"all .1s"}}>
+                      <input type="checkbox" checked={!!checked[r.en]} disabled={alreadyIn}
+                        onChange={() => !alreadyIn&&setChecked(c=>({...c,[r.en]:!c[r.en]}))}
                         style={{accentColor:T.acc2,width:15,height:15,flexShrink:0}} />
                       <div style={{flex:1,minWidth:0}}>
                         <div style={{display:"flex",alignItems:"center",gap:6}}>
-                          <span style={{fontFamily:"'DM Mono',monospace",fontSize:14,fontWeight:500}}>{r.word}</span>
-                          <span style={S.badge(typeColors[r.type]||T.tx3,{fontSize:9})}>{typeLabels[r.type]||r.type}</span>
+                          <span style={{fontFamily:"'DM Mono',monospace",fontSize:14,fontWeight:500}}>{r.en}</span>
+                          <span style={S.badge(T.acc2,{fontSize:9})}>synonim</span>
                           {alreadyIn && <span style={{fontSize:10,color:T.green}}>✓ w bazie</span>}
                         </div>
                         {r.pl && <div style={{fontSize:12,color:T.tx2,marginTop:1}}>{r.pl}</div>}
@@ -2192,7 +2176,7 @@ function SynonymPanel({ word, ctx, autoOpen=false }) {
               )}
               {!hasKey && (
                 <div style={{fontSize:11,color:T.tx3,marginTop:8,textAlign:"center"}}>
-                  💡 Dodaj klucz Gemini (kliknij swoje imię) aby uzyskać tłumaczenia PL
+                  💡 Dodaj klucz Groq (kliknij swoje imię) aby uzyskać synonimy
                 </div>
               )}
             </>
@@ -3876,6 +3860,4 @@ function AddUserModal({ onAdd, onClose }) {
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(React.createElement(App));
 document.getElementById('loading').style.display = 'none';
-</script>
-</body>
-</html>
+</script></body></html>
