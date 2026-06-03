@@ -8,41 +8,33 @@
 <meta name="theme-color" content="#0d0c0b">
 <title>VocabLab v2.0</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-  body { background: #0d0c0b; overscroll-behavior: none; }
-  #root { min-height: 100vh; }
-  #loading { position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#0d0c0b;color:#f5c842;font-family:serif;font-size:32px;gap:16px;z-index:9999; }
-  #loading .sub { font-size:11px;color:#5c5a56;font-family:monospace; }
-  #loading .spin { width:32px;height:32px;border:3px solid #2a2826;border-top-color:#f5c842;border-radius:50%;animation:spin 1s linear infinite; }
-  @keyframes spin { to { transform:rotate(360deg); } }
-  #err { display:none;position:fixed;inset:0;background:#0d0c0b;color:#f05a5a;font-family:monospace;font-size:14px;padding:20px;overflow:auto;z-index:9999; }
+* { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+body { background:#0d0c0b; overscroll-behavior:none; }
+#root { min-height:100vh; }
+#loading { position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#0d0c0b;color:#f5c842;font-family:serif;font-size:32px;gap:16px;z-index:9999; }
+#loading .sub { font-size:11px;color:#5c5a56;font-family:monospace; }
+#loading .spin { width:32px;height:32px;border:3px solid #2a2826;border-top-color:#f5c842;border-radius:50%;animation:spin 1s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+#err { display:none;position:fixed;inset:0;background:#0d0c0b;color:#f05a5a;font-family:monospace;font-size:13px;padding:20px;overflow:auto;z-index:9999;white-space:pre-wrap; }
 </style>
 </head>
 <body>
-<div id="loading">
-  <div>VocabLab</div>
-  <div class="sub">v2.0</div>
-  <div class="spin"></div>
-</div>
+<div id="loading"><div>VocabLab</div><div class="sub">v2.0</div><div class="spin"></div></div>
 <div id="err"></div>
 <div id="root"></div>
-
 <script>
-window.addEventListener('error', function(e) {
-  document.getElementById('loading').style.display = 'none';
-  var d = document.getElementById('err');
-  d.style.display = 'block';
-  d.innerHTML = '<h2 style="margin-bottom:12px">Błąd:</h2>' + e.message + '<br><br>Linia: ' + e.lineno;
+window.addEventListener('error',function(e){
+  document.getElementById('loading').style.display='none';
+  var d=document.getElementById('err');
+  d.style.display='block';
+  d.textContent='Błąd (linia '+e.lineno+'): '+e.message;
 });
 </script>
-
 <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
 <script src="https://unpkg.com/@babel/standalone@7.23.10/babel.min.js"></script>
-
 <script type="text/babel">
 const { useState, useEffect, useRef, useCallback, useMemo } = React;
-
 
 // ════════════════════════════════════════════════════════════
 //  § 1. CONSTANTS
@@ -707,17 +699,77 @@ function App() {
   function updateProgress(itemId, result) {
     mutate(d => {
       const key = `${currentUser?.id}_${itemId}`;
-      const p = d.progress[key] || { score:0, streak:0, nextReview:0, lastSeen:0 };
-      p.score = result.correct ? Math.max(0,p.score)+1 : p.score-1;
-      p.streak = result.correct ? p.streak+1 : 0;
-      p.nextReview = result.correct ? Date.now()+(p.score*8*3600000) : Date.now()+1800000;
+      const p = d.progress[key] || {
+        score: 0, streak: 0, nextReview: 0, lastSeen: 0,
+        interval: 0,   // dni do następnej powtórki
+        easeFactor: 2.5, // współczynnik łatwości SM-2
+        history: [],   // [{date, quality}] — 0=wrong, 1=partial, 2=full
+        totalReviews: 0,
+        correctCount: 0,
+      };
+
+      // quality: 0=wrong, 1=partial, 2=full
+      const quality = result.quality === "full" ? 2
+        : result.quality === "partial" ? 1 : 0;
+
+      // Zapisz do historii (max 50 wpisów)
+      const histEntry = { date: Date.now(), quality };
+      p.history = [...(p.history || []).slice(-49), histEntry];
+      p.totalReviews = (p.totalReviews || 0) + 1;
+      if (quality > 0) p.correctCount = (p.correctCount || 0) + 1;
+
       p.lastSeen = Date.now();
+
+      // ── SM-2 algorithm ─────────────────────────────────────
+      // Przerwy: 1d → 3d → 7d → 14d → 30d → ... × easeFactor
+      const INTERVALS = [1, 3, 7, 14, 30]; // dni dla pierwszych 5 powtórek
+
+      if (quality === 0) {
+        // Błąd — wróć na sam początek krzywej, ale nie zeruj easeFactor
+        p.streak = 0;
+        p.score = Math.max(0, (p.score || 0) - 1);
+        p.interval = 0;
+        p.nextReview = Date.now() + 30 * 60 * 1000; // 30 minut
+        // Easiness factor lekko spada przy błędzie
+        p.easeFactor = Math.max(1.3, (p.easeFactor || 2.5) - 0.2);
+      } else if (quality === 1) {
+        // Partial — następnego dnia, nie resetuje krzywej
+        p.streak = Math.max(0, (p.streak || 0)); // nie zwiększa streak
+        p.score = (p.score || 0); // bez zmiany score
+        p.interval = 1;
+        p.nextReview = Date.now() + DAY_MS;
+        // easeFactor bez zmian przy partial
+      } else {
+        // Full — SM-2 proper
+        p.streak = (p.streak || 0) + 1;
+        p.score = (p.score || 0) + 1;
+
+        if (p.streak <= INTERVALS.length) {
+          // Pierwsze powtórki — ustalone przerwy
+          p.interval = INTERVALS[p.streak - 1] || 30;
+        } else {
+          // Kolejne — mnożnik easeFactor
+          p.interval = Math.round((p.interval || 30) * (p.easeFactor || 2.5));
+        }
+
+        // Easiness factor rośnie przy seriach poprawnych
+        p.easeFactor = Math.min(3.0,
+          (p.easeFactor || 2.5) + 0.1 - (2 - quality) * (0.08 + (2 - quality) * 0.02)
+        );
+
+        p.nextReview = Date.now() + p.interval * DAY_MS;
+      }
+
       d.progress[key] = p;
     });
   }
 
   function getProgress(itemId) {
-    return data.progress[`${currentUser?.id}_${itemId}`] || { score:0, streak:0, nextReview:0, lastSeen:0 };
+    return data.progress[`${currentUser?.id}_${itemId}`] || {
+      score: 0, streak: 0, nextReview: 0, lastSeen: 0,
+      interval: 0, easeFactor: 2.5, history: [],
+      totalReviews: 0, correctCount: 0,
+    };
   }
 
   function exportData() {
@@ -997,6 +1049,7 @@ function AppShell({ ctx }) {
     { id:"learn",   icon:"📚", label:"Nauka" },
     { id:"library", icon:"🗂",  label:"Baza" },
     { id:"sets",    icon:"📋", label:"Zbiory" },
+    { id:"import",  icon:"📥", label:"Import" },
   ];
 
   const hasKey = !!getGeminiKey(currentUser.id);
@@ -1007,8 +1060,9 @@ function AppShell({ ctx }) {
       <div style={{ background:T.s1, borderBottom:`1px solid ${T.b1}`, padding:"10px 16px",
         display:"flex", alignItems:"center", justifyContent:"space-between", flexShrink:0 }}>
         <div style={{ display:"flex", alignItems:"baseline", gap:6 }}>
-          <div style={{ fontFamily:"'DM Serif Display',serif", fontSize:19, color:T.acc, letterSpacing:-0.5 }}>VocabLab</div>
-          <div style={{ fontSize:10, color:T.tx3, fontFamily:"'DM Mono',monospace" }}>v{APP_VERSION}</div>
+          <div style={{ fontFamily:"'DM Serif Display',serif", fontSize:19, color:T.acc, letterSpacing:-0.5 }}>
+            VocabLab <span style={{ fontSize:11, color:T.acc2, fontFamily:"'DM Mono',monospace", fontStyle:"normal" }}>v{APP_VERSION}</span>
+          </div>
         </div>
         <div style={S.row({ gap:8 })}>
           {(isTeacher(currentUser)||isAdmin(currentUser)) && (
@@ -1039,6 +1093,7 @@ function AppShell({ ctx }) {
         {tab==="learn"   && <LearnTab   ctx={ctx} />}
         {tab==="library" && <LibraryTab ctx={ctx} />}
         {tab==="sets"    && <SetsTab    ctx={ctx} />}
+        {tab==="import"  && <ImportTab  ctx={ctx} />}
         {tab==="manage"  && <ManageTab  ctx={ctx} />}
       </div>
 
@@ -1452,7 +1507,7 @@ function FlashcardSession({ config, ctx, onDone, onExit }) {
 
   function respond(knew) {
     setExitAnim(knew?"knew":"didnt");
-    ctx.updateProgress(current.id, { correct:knew });
+    ctx.updateProgress(current.id, { quality: knew ? "full" : "wrong", correct: knew });
     setStats(s => ({ knew:s.knew+(knew?1:0), didnt:s.didnt+(knew?0:1) }));
     if (!knew) {
       setQueue(q => {
@@ -1669,7 +1724,7 @@ function QuizSession({ config, ctx, onDone, onExit }) {
       partial: s.partial+(result.quality==="partial"?1:0),
       wrong:   s.wrong+(result.quality==="wrong"?1:0),
     }));
-    ctx.updateProgress(current.id, { correct:isCorrect });
+    ctx.updateProgress(current.id, { quality: result.quality, correct: isCorrect });
 
     if (mode==="session"&&!isCorrect) {
       setQueue(q => {
@@ -2037,48 +2092,222 @@ function SynonymPanel({ word, ctx, autoOpen=false }) {
 
 function LibraryTab({ ctx }) {
   const { data, currentUser, getProgress } = ctx;
-  const [search, setSearch]         = useState("");
-  const [filterTopic, setFilterTopic]   = useState("all");
+  const [search, setSearch]           = useState("");
+  const [filterTopic, setFilterTopic] = useState("all");
   const [filterGrammar, setFilterGrammar] = useState("all");
-  const [filterTime, setFilterTime]   = useState("all");
+  const [filterAdded, setFilterAdded] = useState("all");   // kiedy DODANO
+  const [filterSeen, setFilterSeen]   = useState("all");   // kiedy ODPYTYWANO
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterSet, setFilterSet]     = useState("all");
   const [editing, setEditing]         = useState(null);
+  const [detailItem, setDetailItem]   = useState(null);    // szczegóły słowa
   const [showAdd, setShowAdd]         = useState(false);
   const [showImport, setShowImport]   = useState(false);
   const [selectedIds, setSelectedIds] = useState([]);
   const [showAssignSet, setShowAssignSet] = useState(false);
   const [expandSynonym, setExpandSynonym] = useState(null);
-  const [showFilters, setShowFilters]   = useState(false);
+  const [showFilters, setShowFilters] = useState(false);
 
   const canEdit = isAdmin(currentUser)||isTeacher(currentUser);
 
   function getItemStatus(item) {
     if (item.status==="pending") return { label:"Oczekuje", color:T.acc };
     const p = getProgress(item.id);
-    if (p.score<0)                  return { label:"Trudne",  color:T.red };
-    if (p.score===0&&!p.lastSeen)   return { label:"Nowe",    color:T.tx3 };
-    if (p.score>=4)                 return { label:"Znam",    color:T.green };
+    if (!p.lastSeen)              return { label:"Nowe",    color:T.tx3 };
+    if (p.score<0)                return { label:"Trudne",  color:T.red };
+    if (p.score>=5)               return { label:"Znam",    color:T.green };
     return { label:"Uczę się", color:T.acc2 };
   }
 
+  // Formatuj czas relatywnie
+  function relativeTime(ts) {
+    if (!ts) return null;
+    const diff = Date.now() - ts;
+    const mins = Math.floor(diff / 60000);
+    const hours = Math.floor(diff / 3600000);
+    const days = Math.floor(diff / DAY_MS);
+    if (mins < 1)   return "przed chwilą";
+    if (mins < 60)  return `${mins} min temu`;
+    if (hours < 24) return `${hours}h temu`;
+    if (days === 1) return "wczoraj";
+    if (days < 7)   return `${days} dni temu`;
+    if (days < 30)  return `${Math.floor(days/7)} tyg. temu`;
+    return `${Math.floor(days/30)} mies. temu`;
+  }
+
+  function nextReviewText(ts) {
+    if (!ts || ts <= Date.now()) return { text:"teraz", color:T.red };
+    const diff = ts - Date.now();
+    const hours = Math.floor(diff / 3600000);
+    const days  = Math.floor(diff / DAY_MS);
+    if (hours < 1)  return { text:"za chwilę", color:T.acc };
+    if (hours < 24) return { text:`za ${hours}h`, color:T.acc };
+    if (days === 1) return { text:"jutro", color:T.acc2 };
+    if (days < 30)  return { text:`za ${days} dni`, color:T.acc2 };
+    return { text:`za ${Math.floor(days/30)} mies.`, color:T.green };
+  }
+
+  // Filtr po dacie odpytywania
+  function matchesSeenFilter(p, filter) {
+    if (filter === "all") return true;
+    if (filter === "never") return !p.lastSeen;
+    if (filter === "due") return p.nextReview <= Date.now() && !!p.lastSeen;
+    return matchesTimeFilter(p.lastSeen, filter);
+  }
+
   const filtered = useMemo(() => data.items.filter(item => {
-    const q = search.toLowerCase();
+    const q  = search.toLowerCase();
+    const p  = getProgress(item.id);
     const mq = !q || item.en.toLowerCase().includes(q) || item.pl.toLowerCase().includes(q);
     const mt = filterTopic==="all"   || item.topic===filterTopic;
     const mg = filterGrammar==="all" || item.grammarType===filterGrammar;
     const ms = filterStatus==="all"  || getItemStatus(item).label===filterStatus;
-    const mtime = matchesTimeFilter(item.addedAt, filterTime);
+    const ma = matchesTimeFilter(item.addedAt, filterAdded);
+    const mseen = matchesSeenFilter(p, filterSeen);
     const mset = filterSet==="all"   || (item.sets||[]).includes(filterSet);
-    return mq && mt && mg && ms && mtime && mset;
-  }), [data.items, search, filterTopic, filterGrammar, filterStatus, filterTime, filterSet, data.progress]);
+    return mq && mt && mg && ms && ma && mseen && mset;
+  }), [data.items, search, filterTopic, filterGrammar, filterStatus,
+      filterAdded, filterSeen, filterSet, data.progress]);
 
   function toggleSelect(id) {
     setSelectedIds(s => s.includes(id)?s.filter(x=>x!==id):[...s,id]);
   }
 
-  // Zlicz aktywne filtry
-  const activeFilterCount = [filterTopic,filterGrammar,filterTime,filterStatus,filterSet].filter(f=>f!=="all").length;
+  const activeFilterCount = [filterTopic,filterGrammar,filterAdded,filterSeen,filterStatus,filterSet].filter(f=>f!=="all").length;
+
+  // Widok szczegółów słowa
+  if (detailItem) {
+    const item = data.items.find(x=>x.id===detailItem);
+    if (!item) { setDetailItem(null); return null; }
+    const p = getProgress(item.id);
+    const gramMeta  = GRAMMAR_TYPES[item.grammarType] || GRAMMAR_TYPES.other;
+    const topicMeta = TOPICS[item.topic||"unset"] || TOPICS.unset;
+    const nrText = nextReviewText(p.nextReview);
+    const lastHistory = (p.history||[]).slice(-10).reverse();
+    const correctPct = p.totalReviews
+      ? Math.round((p.correctCount/p.totalReviews)*100) : 0;
+
+    return (
+      <div style={S.col(14)}>
+        <button onClick={()=>setDetailItem(null)} style={S.btn("ghost",true)}>← Wróć do bazy</button>
+
+        {/* Karta słowa */}
+        <div style={S.card({borderColor:gramMeta.color})}>
+          <div style={{fontFamily:"'DM Serif Display',serif",fontSize:32,color:T.acc,letterSpacing:-0.5,marginBottom:4}}>
+            {item.en}
+          </div>
+          <div style={{fontFamily:"'DM Serif Display',serif",fontSize:22,color:T.tx2,marginBottom:10}}>
+            {item.pl}
+          </div>
+          {item.forms && (
+            <div style={{fontFamily:"'DM Mono',monospace",fontSize:13,color:T.tx3,marginBottom:8}}>
+              {item.forms.past} · {item.forms.pp}
+            </div>
+          )}
+          {item.example && (
+            <div style={{fontSize:13,color:T.tx2,fontStyle:"italic",marginBottom:2}}>„{item.example}"</div>
+          )}
+          {item.example_pl && (
+            <div style={{fontSize:12,color:T.tx3,fontStyle:"italic",marginBottom:10}}>„{item.example_pl}"</div>
+          )}
+          <div style={S.row({gap:6,flexWrap:"wrap"})}>
+            <span style={S.badge(gramMeta.color,{fontSize:10})}>{gramMeta.icon} {gramMeta.label}</span>
+            {item.topic!=="unset" && <span style={S.badge(topicMeta.color,{fontSize:10})}>{topicMeta.icon} {topicMeta.label}</span>}
+          </div>
+        </div>
+
+        {/* Statystyki nauki */}
+        <div style={S.card()}>
+          <div style={{fontSize:12,color:T.tx3,fontFamily:"'DM Mono',monospace",
+            textTransform:"uppercase",letterSpacing:"1px",marginBottom:12}}>Statystyki nauki</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+            {[
+              { l:"Odpytano łącznie", v: p.totalReviews||0,       c:T.tx },
+              { l:"Poprawnie",        v: `${correctPct}%`,         c:T.green },
+              { l:"Seria z rzędu",    v: p.streak||0,              c:T.acc },
+              { l:"Poziom trudności", v: p.easeFactor?.toFixed(1)||"2.5", c:T.acc2 },
+            ].map(x => (
+              <div key={x.l} style={S.card2({textAlign:"center"})}>
+                <div style={{fontFamily:"'DM Serif Display',serif",fontSize:22,color:x.c}}>{x.v}</div>
+                <div style={{fontSize:10,color:T.tx3}}>{x.l}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={S.col(8)}>
+            <div style={S.row({justifyContent:"space-between"})}>
+              <span style={{fontSize:13,color:T.tx3}}>Dodano</span>
+              <span style={{fontSize:13,color:T.tx}}>{new Date(item.addedAt).toLocaleDateString("pl")}</span>
+            </div>
+            <div style={S.row({justifyContent:"space-between"})}>
+              <span style={{fontSize:13,color:T.tx3}}>Ostatnio odpytywano</span>
+              <span style={{fontSize:13,color:T.tx}}>{p.lastSeen ? relativeTime(p.lastSeen) : "nigdy"}</span>
+            </div>
+            <div style={S.row({justifyContent:"space-between"})}>
+              <span style={{fontSize:13,color:T.tx3}}>Następna powtórka</span>
+              <span style={{fontSize:13,color:nrText.color,fontWeight:600}}>{p.lastSeen ? nrText.text : "—"}</span>
+            </div>
+            {p.interval > 0 && (
+              <div style={S.row({justifyContent:"space-between"})}>
+                <span style={{fontSize:13,color:T.tx3}}>Bieżący interwał</span>
+                <span style={{fontSize:13,color:T.acc2}}>{p.interval} {p.interval===1?"dzień":"dni"}</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Historia ostatnich 10 odpytań */}
+        {lastHistory.length > 0 && (
+          <div style={S.card()}>
+            <div style={{fontSize:12,color:T.tx3,fontFamily:"'DM Mono',monospace",
+              textTransform:"uppercase",letterSpacing:"1px",marginBottom:12}}>Historia odpytywań</div>
+            <div style={S.col(6)}>
+              {lastHistory.map((h,i) => {
+                const qIcon  = h.quality===2?"✓":h.quality===1?"≈":"✗";
+                const qColor = h.quality===2?T.green:h.quality===1?T.acc:T.red;
+                const qLabel = h.quality===2?"Poprawnie":h.quality===1?"Częściowo":"Błąd";
+                return (
+                  <div key={i} style={S.row({justifyContent:"space-between"})}>
+                    <div style={S.row({gap:8})}>
+                      <span style={{fontSize:16,color:qColor,width:20}}>{qIcon}</span>
+                      <span style={{fontSize:13,color:qColor,fontWeight:500}}>{qLabel}</span>
+                    </div>
+                    <span style={{fontSize:12,color:T.tx3}}>{relativeTime(h.date)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Pasek krzywej SRS */}
+        {p.totalReviews > 0 && (
+          <div style={S.card2()}>
+            <div style={{fontSize:11,color:T.tx3,marginBottom:8}}>Krzywa powtórek (ostatnie 10)</div>
+            <div style={{display:"flex",gap:3,alignItems:"flex-end",height:32}}>
+              {[...Array(10)].map((_,i) => {
+                const h = lastHistory[9-i];
+                const color = !h?T.b2:h.quality===2?T.green:h.quality===1?T.acc:T.red;
+                const height = !h?4:h.quality===2?32:h.quality===1?20:8;
+                return <div key={i} style={{flex:1,height,background:color,borderRadius:2,transition:"height .3s"}} />;
+              })}
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:T.tx3,marginTop:4}}>
+              <span>dawniej</span><span>teraz</span>
+            </div>
+          </div>
+        )}
+
+        {canEdit && (
+          <button onClick={()=>setEditing({...item})} style={S.btn("ghost")}>✏️ Edytuj słowo</button>
+        )}
+
+        {editing && <EditItemModal item={editing} ctx={ctx}
+          onSave={changes=>{ctx.updateItem(editing.id,changes);setEditing(null);ctx.showToast("Zapisano");}}
+          onClose={()=>setEditing(null)} />}
+      </div>
+    );
+  }
 
   return (
     <div style={S.col(12)}>
@@ -2090,20 +2319,46 @@ function LibraryTab({ ctx }) {
           <input style={{...S.input(),flex:1}} value={search}
             onChange={e=>setSearch(e.target.value)} placeholder="🔍  Szukaj…" />
           <button onClick={()=>setShowFilters(f=>!f)}
-            style={{...S.btn(activeFilterCount>0?"primary":"ghost",true),
-              position:"relative", flexShrink:0}}>
+            style={S.btn(activeFilterCount>0?"primary":"ghost",true)}>
             🔽 Filtry{activeFilterCount>0?` (${activeFilterCount})`:""}
           </button>
         </div>
 
         {showFilters && (
-          <div style={S.card2({ borderColor:T.acc2 })}>
-            <div style={{ fontSize:11, color:T.acc2, fontFamily:"'DM Mono',monospace",
-              textTransform:"uppercase", letterSpacing:"1px", marginBottom:10 }}>Filtry</div>
+          <div style={S.card2({borderColor:T.acc2})}>
+            <div style={{fontSize:11,color:T.acc2,fontFamily:"'DM Mono',monospace",
+              textTransform:"uppercase",letterSpacing:"1px",marginBottom:10}}>Filtry</div>
             <div style={S.col(10)}>
+
+              {/* Kiedy dodano */}
+              <div>
+                <label style={S.label}>📅 Kiedy dodano</label>
+                <select value={filterAdded} onChange={e=>setFilterAdded(e.target.value)}
+                  style={{...S.input(),cursor:"pointer"}}>
+                  <option value="all">Wszystkie daty dodania</option>
+                  <option value="today">Dodane dziś</option>
+                  <option value="week">Dodane w ostatnich 7 dniach</option>
+                  <option value="month">Dodane w ostatnich 30 dniach</option>
+                </select>
+              </div>
+
+              {/* Kiedy ostatnio odpytywano */}
+              <div>
+                <label style={S.label}>👁 Kiedy ostatnio odpytywano</label>
+                <select value={filterSeen} onChange={e=>setFilterSeen(e.target.value)}
+                  style={{...S.input(),cursor:"pointer"}}>
+                  <option value="all">Wszystkie</option>
+                  <option value="never">Nigdy nie odpytywane</option>
+                  <option value="due">Wymagają powtórki teraz</option>
+                  <option value="today">Odpytywane dziś</option>
+                  <option value="week">Odpytywane w ostatnich 7 dniach</option>
+                  <option value="month">Odpytywane w ostatnich 30 dniach</option>
+                </select>
+              </div>
+
               {/* Temat */}
               <div>
-                <label style={S.label}>Temat tematyczny</label>
+                <label style={S.label}>🏷 Temat tematyczny</label>
                 <select value={filterTopic} onChange={e=>setFilterTopic(e.target.value)}
                   style={{...S.input(),cursor:"pointer"}}>
                   <option value="all">Wszystkie tematy</option>
@@ -2112,9 +2367,10 @@ function LibraryTab({ ctx }) {
                   ))}
                 </select>
               </div>
+
               {/* Typ gramatyczny */}
               <div>
-                <label style={S.label}>Typ gramatyczny</label>
+                <label style={S.label}>📝 Typ gramatyczny</label>
                 <select value={filterGrammar} onChange={e=>setFilterGrammar(e.target.value)}
                   style={{...S.input(),cursor:"pointer"}}>
                   <option value="all">Wszystkie typy</option>
@@ -2123,21 +2379,11 @@ function LibraryTab({ ctx }) {
                   ))}
                 </select>
               </div>
-              {/* Czas */}
-              <div>
-                <label style={S.label}>Czas dodania</label>
-                <select value={filterTime} onChange={e=>setFilterTime(e.target.value)}
-                  style={{...S.input(),cursor:"pointer"}}>
-                  <option value="all">Wszystkie czasy</option>
-                  <option value="today">Dziś</option>
-                  <option value="week">Ostatnie 7 dni</option>
-                  <option value="month">Ostatnie 30 dni</option>
-                </select>
-              </div>
+
               {/* Zbiór */}
               {data.sets.length>0 && (
                 <div>
-                  <label style={S.label}>Zbiór zadaniowy</label>
+                  <label style={S.label}>📋 Zbiór zadaniowy</label>
                   <select value={filterSet} onChange={e=>setFilterSet(e.target.value)}
                     style={{...S.input(),cursor:"pointer"}}>
                     <option value="all">Wszystkie zbiory</option>
@@ -2147,9 +2393,10 @@ function LibraryTab({ ctx }) {
                   </select>
                 </div>
               )}
+
               {/* Status */}
               <div>
-                <label style={S.label}>Status nauki</label>
+                <label style={S.label}>📊 Status nauki</label>
                 <select value={filterStatus} onChange={e=>setFilterStatus(e.target.value)}
                   style={{...S.input(),cursor:"pointer"}}>
                   {["all","Nowe","Oczekuje","Uczę się","Znam","Trudne"].map(s => (
@@ -2157,10 +2404,13 @@ function LibraryTab({ ctx }) {
                   ))}
                 </select>
               </div>
+
               {activeFilterCount>0 && (
-                <button onClick={() => { setFilterTopic("all"); setFilterGrammar("all");
-                  setFilterTime("all"); setFilterStatus("all"); setFilterSet("all"); }}
-                  style={{...S.btn("ghost",true),alignSelf:"flex-start"}}>
+                <button onClick={() => {
+                  setFilterTopic("all"); setFilterGrammar("all");
+                  setFilterAdded("all"); setFilterSeen("all");
+                  setFilterStatus("all"); setFilterSet("all");
+                }} style={{...S.btn("ghost",true),alignSelf:"flex-start"}}>
                   ✕ Wyczyść filtry
                 </button>
               )}
@@ -2184,9 +2434,7 @@ function LibraryTab({ ctx }) {
           display:"flex",justifyContent:"space-between",alignItems:"center"})}>
           <div style={{fontSize:13,color:T.acc}}>Zaznaczono: {selectedIds.length}</div>
           <div style={S.row({gap:6})}>
-            <button style={S.btn("primary",true)} onClick={()=>setShowAssignSet(true)}>
-              Dodaj do zbioru
-            </button>
+            <button style={S.btn("primary",true)} onClick={()=>setShowAssignSet(true)}>Dodaj do zbioru</button>
             <button style={S.btn("ghost",true)} onClick={()=>setSelectedIds([])}>Odznacz</button>
           </div>
         </div>
@@ -2206,8 +2454,14 @@ function LibraryTab({ ctx }) {
         {filtered.map(item => {
           const st = getItemStatus(item);
           const sel = selectedIds.includes(item.id);
-          const gramMeta = GRAMMAR_TYPES[item.grammarType];
+          const gramMeta  = GRAMMAR_TYPES[item.grammarType];
           const topicMeta = TOPICS[item.topic||"unset"];
+          const p = getProgress(item.id);
+          const nrText = nextReviewText(p.nextReview);
+          const lastQ = p.history?.length ? p.history[p.history.length-1] : null;
+          const lastQIcon  = lastQ ? (lastQ.quality===2?"✓":lastQ.quality===1?"≈":"✗") : null;
+          const lastQColor = lastQ ? (lastQ.quality===2?T.green:lastQ.quality===1?T.acc:T.red) : T.tx3;
+
           return (
             <div key={item.id}
               style={{background:sel?`${T.acc}08`:T.s1,
@@ -2216,7 +2470,9 @@ function LibraryTab({ ctx }) {
                 display:"flex",gap:10,alignItems:"flex-start",transition:"all .1s"}}>
               <input type="checkbox" checked={sel} onChange={()=>toggleSelect(item.id)}
                 style={{width:16,height:16,marginTop:2,accentColor:T.acc,flexShrink:0}} />
-              <div style={{flex:1,minWidth:0}}>
+
+              {/* Klikalna część — otwiera szczegóły */}
+              <div style={{flex:1,minWidth:0,cursor:"pointer"}} onClick={()=>setDetailItem(item.id)}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
                   <div>
                     <span style={{fontFamily:"'DM Mono',monospace",fontWeight:500,fontSize:14}}>{item.en}</span>
@@ -2224,19 +2480,45 @@ function LibraryTab({ ctx }) {
                   </div>
                   <span style={S.badge(st.color,{flexShrink:0})}>{st.label}</span>
                 </div>
-                <div style={{fontSize:13,color:T.tx2,marginTop:2}}>{item.pl}</div>
-                {item.example_pl && (
-                  <div style={{fontSize:11,color:T.tx3,marginTop:3,fontStyle:"italic"}}>„{item.example_pl}"</div>
-                )}
-                <div style={{...S.row({gap:4,marginTop:6,flexWrap:"wrap"})}}>
+                <div style={{fontSize:13,color:T.tx2,marginTop:1}}>{item.pl}</div>
+
+                {/* Wiersz z datami */}
+                <div style={S.row({gap:12,marginTop:5,flexWrap:"wrap"})}>
+                  {/* Ostatnie odpytanie */}
+                  {p.lastSeen ? (
+                    <div style={S.row({gap:4})}>
+                      {lastQIcon && <span style={{fontSize:12,color:lastQColor,fontWeight:700}}>{lastQIcon}</span>}
+                      <span style={{fontSize:11,color:T.tx3}}>{relativeTime(p.lastSeen)}</span>
+                    </div>
+                  ) : (
+                    <span style={{fontSize:11,color:T.tx3}}>nie odpytywane</span>
+                  )}
+
+                  {/* Następna powtórka */}
+                  {p.lastSeen && (
+                    <div style={S.row({gap:4})}>
+                      <span style={{fontSize:11,color:T.tx3}}>powtórka:</span>
+                      <span style={{fontSize:11,color:nrText.color,fontWeight:500}}>{nrText.text}</span>
+                    </div>
+                  )}
+
+                  {/* Seria */}
+                  {p.streak > 1 && (
+                    <span style={{fontSize:11,color:T.acc}}>🔥 {p.streak}×</span>
+                  )}
+                </div>
+
+                {/* Tagi */}
+                <div style={S.row({gap:4,marginTop:5,flexWrap:"wrap"})}>
                   {gramMeta && <span style={S.badge(gramMeta.color,{fontSize:9})}>{gramMeta.icon} {gramMeta.label}</span>}
-                  {topicMeta && item.topic!=="unset" && <span style={S.badge(topicMeta.color,{fontSize:9})}>{topicMeta.icon} {topicMeta.label}</span>}
+                  {topicMeta&&item.topic!=="unset" && <span style={S.badge(topicMeta.color,{fontSize:9})}>{topicMeta.icon} {topicMeta.label}</span>}
                   {(item.sets||[]).map(setId => {
                     const s = data.sets.find(x=>x.id===setId);
                     return s ? <span key={setId} style={S.badge(T.acc3,{fontSize:9})}>📋 {s.name}</span> : null;
                   })}
                 </div>
               </div>
+
               {canEdit && (
                 <div style={S.col(4,{flexShrink:0})}>
                   <button onClick={()=>setEditing({...item})}
@@ -2282,6 +2564,7 @@ function LibraryTab({ ctx }) {
     </div>
   );
 }
+
 
 // ════════════════════════════════════════════════════════════
 //  § 16. SETS TAB
@@ -2460,6 +2743,415 @@ function SetSession({ config, ctx, onDone, onExit }) {
   if (mode==="flashcard")
     return <FlashcardSession config={config} ctx={ctx} onDone={handleDone} onExit={onExit} />;
   return <QuizSession config={config} ctx={ctx} onDone={handleDone} onExit={onExit} />;
+}
+
+// ════════════════════════════════════════════════════════════
+//  § 16b. IMPORT TAB
+//  Import ze zdjęcia (AI) lub pliku CSV/TXT
+// ════════════════════════════════════════════════════════════
+
+function ImportTab({ ctx }) {
+  const [mode, setMode]         = useState(null); // null | "photo" | "csv" | "text"
+  const [status, setStatus]     = useState("idle"); // idle | loading | preview | done
+  const [preview, setPreview]   = useState([]);
+  const [imageData, setImageData] = useState(null);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState(null);
+  const [csvText, setCsvText]   = useState("");
+  const [textInput, setTextInput] = useState("");
+  const [grammarType, setGrammarType] = useState("verb_irregular");
+  const [topic, setTopic]       = useState("unset");
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [assignSet, setAssignSet] = useState("");
+  const [newSetName, setNewSetName] = useState("");
+  const fileInputRef = useRef();
+  const photoInputRef = useRef();
+
+  const hasKey = !!getGeminiKey(ctx.currentUser?.id);
+  const userId = ctx.currentUser?.id;
+
+  // Obsługa zdjęcia
+  function handlePhoto(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const base64 = ev.target.result.split(",")[1];
+      setImageData({ base64, mimeType: file.type });
+      setImagePreviewUrl(ev.target.result);
+      setMode("photo");
+      setStatus("idle");
+      setPreview([]);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // Skanowanie zdjęcia przez Gemini
+  async function scanPhoto() {
+    if (!imageData) return;
+    if (!hasKey) { ctx.showToast("Wymaga klucza Gemini AI", T.red); return; }
+    setStatus("loading");
+    try {
+      const key = getGeminiKey(userId);
+      const prompt = `Przeanalizuj to zdjęcie podręcznika lub zeszytu i wyciągnij wszystkie angielskie słówka wraz z polskimi tłumaczeniami.
+Zwróć TYLKO JSON w formacie:
+[{"en":"word","pl":"tłumaczenie","grammarType":"noun|verb_irregular|verb_regular|adjective|adverb|phrasal_verb|idiom|expression|other","topic":"home|health|food|transport|body|family|emotions|nature|city|work|education|economy|sport|technology|art|entertainment|shopping|clothes|politics|unset","forms":{"past":"...","pp":"..."},"example":"zdanie EN","example_pl":"zdanie PL"}]
+Jeśli słowo nie ma form czasownikowych, ustaw forms na null.
+Wyciągnij WSZYSTKIE słówka widoczne na zdjęciu.`;
+
+      const res = await fetch(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+          body: JSON.stringify({
+            contents: [{ parts: [
+              { inline_data: { mime_type: imageData.mimeType, data: imageData.base64 } },
+              { text: prompt }
+            ]}],
+            generationConfig: { temperature: 0.1, maxOutputTokens: 2000 }
+          })
+        }
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(()=>({}));
+        throw new Error(err?.error?.message || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const clean = text.replace(/```json|```/g,"").trim();
+      const parsed = JSON.parse(clean);
+      // Sprawdź duplikaty
+      const withDupInfo = parsed.map(item => ({
+        ...item,
+        _selected: true,
+        _dup: checkDuplicate(item, ctx.data.items),
+      }));
+      setPreview(withDupInfo);
+      setSelectedIds(withDupInfo.filter(w=>!w._dup).map((_,i)=>i));
+      setStatus("preview");
+    } catch(e) {
+      ctx.showToast("Błąd skanowania: " + e.message, T.red);
+      setStatus("idle");
+    }
+  }
+
+  // Parse CSV/tekst
+  function parseCSV(text) {
+    const lines = text.split("\n").map(l=>l.trim()).filter(l=>l&&!l.startsWith("#"));
+    return lines.map(line => {
+      const p = line.split(",").map(s=>s.trim().replace(/^"|"$/g,""));
+      const [en,pl,past,pp,ex,exPl] = p;
+      if (!en||!pl) return null;
+      const hasForms = past&&pp;
+      return {
+        en:en.toLowerCase(), pl,
+        grammarType: hasForms?"verb_irregular":grammarType,
+        topic,
+        forms: hasForms?{past,pp}:null,
+        example:ex||null, example_pl:exPl||null,
+        _selected: true,
+        _dup: checkDuplicate({en,pl}, ctx.data.items),
+      };
+    }).filter(Boolean);
+  }
+
+  function handleCSVPreview() {
+    const parsed = parseCSV(csvText||textInput);
+    setPreview(parsed);
+    setSelectedIds(parsed.filter(w=>!w._dup).map((_,i)=>i));
+    setStatus("preview");
+  }
+
+  // Import zaznaczonych
+  function doImport() {
+    const toImport = preview
+      .filter((_,i) => selectedIds.includes(i))
+      .map(({ _selected, _dup, ...item }) => item);
+
+    if (!toImport.length) { ctx.showToast("Nic nie zaznaczono"); return; }
+
+    // Opcjonalnie — przypisz do zbioru
+    let targetSetId = null;
+    if (assignSet === "__new__" && newSetName.trim()) {
+      targetSetId = uid();
+      ctx.addSet({ id:targetSetId, name:newSetName.trim(), dueDate:null,
+        phase:"learn", status:"active", stats:{total:toImport.length,newItems:toImport.length,knownItems:0} });
+    } else if (assignSet && assignSet !== "") {
+      targetSetId = assignSet;
+    }
+
+    if (targetSetId) {
+      toImport.forEach(item => { item.sets = [targetSetId]; });
+    }
+
+    ctx.addItems(toImport);
+    setStatus("done");
+    setPreview([]);
+    setSelectedIds([]);
+    setImageData(null);
+    setImagePreviewUrl(null);
+    setCsvText("");
+    setTextInput("");
+  }
+
+  function toggleSelect(i) {
+    setSelectedIds(s => s.includes(i) ? s.filter(x=>x!==i) : [...s,i]);
+  }
+
+  return (
+    <div style={S.col(16)}>
+      <div style={{ fontFamily:"'DM Serif Display',serif", fontSize:24, letterSpacing:-0.5 }}>Import</div>
+
+      {/* Wybór metody */}
+      {status === "idle" && (
+        <div style={S.col(12)}>
+          <div style={{ fontSize:13, color:T.tx2 }}>Dodaj słówka ze zdjęcia, pliku CSV lub wpisz ręcznie listę.</div>
+
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10 }}>
+            {[
+              { id:"photo", icon:"📸", label:"Zdjęcie", desc:"Skanuj podręcznik lub zeszyt", needsKey:true },
+              { id:"csv",   icon:"📄", label:"Plik CSV", desc:"Importuj z pliku tekstowego", needsKey:false },
+              { id:"text",  icon:"✏️", label:"Wpisz listę", desc:"Wklej lub wpisz ręcznie", needsKey:false },
+            ].map(m => (
+              <button key={m.id} onClick={() => {
+                  if (m.id==="photo") { photoInputRef.current?.click(); }
+                  else { setMode(m.id); }
+                }}
+                style={{ background:mode===m.id?`${T.acc}12`:T.s1,
+                  border:`1.5px solid ${mode===m.id?T.acc:T.b2}`,
+                  borderRadius:T.r2, padding:"16px 12px", cursor:"pointer",
+                  display:"flex", flexDirection:"column", alignItems:"center", gap:8,
+                  opacity: m.needsKey&&!hasKey ? 0.6 : 1 }}>
+                <span style={{fontSize:28}}>{m.icon}</span>
+                <span style={{fontSize:13,fontWeight:600,color:m.id===mode?T.acc:T.tx}}>{m.label}</span>
+                <span style={{fontSize:11,color:T.tx3,textAlign:"center"}}>{m.desc}</span>
+                {m.needsKey && !hasKey && (
+                  <span style={{fontSize:10,color:T.acc3}}>⚠ wymaga AI</span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {/* Hidden inputs */}
+          <input ref={photoInputRef} type="file" accept="image/*" style={{display:"none"}} onChange={handlePhoto} />
+          <input ref={fileInputRef} type="file" accept=".csv,.txt" style={{display:"none"}}
+            onChange={e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>{setCsvText(ev.target.result);setMode("csv");};r.readAsText(f);}} />
+
+          {/* Photo mode */}
+          {mode==="photo" && imagePreviewUrl && (
+            <div style={S.col(12)}>
+              <img src={imagePreviewUrl} alt="Zdjęcie do skanowania"
+                style={{width:"100%",borderRadius:T.r2,border:`1px solid ${T.b2}`,maxHeight:300,objectFit:"contain"}} />
+              {!hasKey ? (
+                <div style={S.card2({borderColor:T.acc3,background:`${T.acc3}10`})}>
+                  <div style={{fontSize:13,color:T.acc3,fontWeight:600,marginBottom:4}}>⚠️ Wymaga klucza Gemini AI</div>
+                  <div style={{fontSize:12,color:T.tx2}}>Skanowanie zdjęć wymaga klucza API. Kliknij swoje imię w górze ekranu aby dodać klucz.</div>
+                </div>
+              ) : (
+                <button style={{...S.btn("primary"),width:"100%",justifyContent:"center",fontSize:15,padding:"14px"}}
+                  onClick={scanPhoto}>
+                  📸 Skanuj zdjęcie przez AI
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* CSV mode */}
+          {mode==="csv" && (
+            <div style={S.col(12)}>
+              <div style={{fontSize:12,color:T.tx3,lineHeight:1.8,fontFamily:"'DM Mono',monospace",background:T.s2,borderRadius:T.r,padding:"10px 14px"}}>
+                Format: <strong style={{color:T.tx}}>en,pl,past,pp,przykład_EN,przykład_PL</strong><br/>
+                Przykład: <strong style={{color:T.acc}}>go,iść,went,gone</strong>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                <div>
+                  <label style={S.label}>Typ gramatyczny (domyślny)</label>
+                  <select value={grammarType} onChange={e=>setGrammarType(e.target.value)} style={{...S.input(),cursor:"pointer"}}>
+                    {Object.entries(GRAMMAR_TYPES).map(([k,v])=><option key={k} value={k}>{v.icon} {v.label}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label style={S.label}>Temat tematyczny</label>
+                  <select value={topic} onChange={e=>setTopic(e.target.value)} style={{...S.input(),cursor:"pointer"}}>
+                    {Object.entries(TOPICS).map(([k,v])=><option key={k} value={k}>{v.icon} {v.label}</option>)}
+                  </select>
+                </div>
+              </div>
+              <button style={S.btn("ghost",true)} onClick={()=>fileInputRef.current?.click()}>
+                📁 Wybierz plik CSV/TXT
+              </button>
+              {csvText && (
+                <div style={{fontSize:12,color:T.green}}>✓ Plik załadowany ({csvText.split("\n").filter(l=>l.trim()).length} linii)</div>
+              )}
+              <textarea style={{...S.input(),minHeight:120,resize:"vertical"}} value={csvText}
+                onChange={e=>setCsvText(e.target.value)}
+                placeholder={"go,iść,went,gone\nbeautiful,piękny\nrun,biegać,ran,run"} />
+              <button style={{...S.btn("primary"),width:"100%",justifyContent:"center"}}
+                onClick={handleCSVPreview} disabled={!csvText.trim()}>
+                👁 Podgląd i import
+              </button>
+            </div>
+          )}
+
+          {/* Text mode */}
+          {mode==="text" && (
+            <div style={S.col(12)}>
+              <div style={{fontSize:12,color:T.tx2}}>Wklej listę słów w formacie CSV lub każde słowo w nowej linii.</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                <div>
+                  <label style={S.label}>Typ gramatyczny</label>
+                  <select value={grammarType} onChange={e=>setGrammarType(e.target.value)} style={{...S.input(),cursor:"pointer"}}>
+                    {Object.entries(GRAMMAR_TYPES).map(([k,v])=><option key={k} value={k}>{v.icon} {v.label}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label style={S.label}>Temat</label>
+                  <select value={topic} onChange={e=>setTopic(e.target.value)} style={{...S.input(),cursor:"pointer"}}>
+                    {Object.entries(TOPICS).map(([k,v])=><option key={k} value={k}>{v.icon} {v.label}</option>)}
+                  </select>
+                </div>
+              </div>
+              <textarea style={{...S.input(),minHeight:160,resize:"vertical"}} value={textInput}
+                onChange={e=>setTextInput(e.target.value)}
+                placeholder={"go,iść,went,gone\nbeautiful,piękny\nrun,biegać,ran,run"} autoFocus />
+              <button style={{...S.btn("primary"),width:"100%",justifyContent:"center"}}
+                onClick={handleCSVPreview} disabled={!textInput.trim()}>
+                👁 Podgląd i import
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Loading */}
+      {status==="loading" && (
+        <div style={S.col(16,{alignItems:"center",padding:"40px 0"})}>
+          <div style={{width:48,height:48,border:`4px solid ${T.b2}`,borderTopColor:T.acc,borderRadius:"50%",animation:"spin 1s linear infinite"}} />
+          <div style={{fontSize:15,color:T.tx2}}>Skanuję zdjęcie…</div>
+          <div style={{fontSize:12,color:T.tx3}}>AI analizuje i wyciąga słówka</div>
+        </div>
+      )}
+
+      {/* Preview */}
+      {status==="preview" && (
+        <div style={S.col(12)}>
+          <div style={S.row({justifyContent:"space-between"})}>
+            <div style={{fontSize:15,fontWeight:600}}>Podgląd importu</div>
+            <button onClick={()=>{setStatus("idle");setPreview([]);}} style={S.btn("ghost",true)}>← Wróć</button>
+          </div>
+
+          {/* Statystyki */}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+            {[
+              { l:"Znaleziono", v:preview.length, c:T.tx },
+              { l:"Nowe",       v:preview.filter(w=>!w._dup).length, c:T.green },
+              { l:"Duplikaty",  v:preview.filter(w=>w._dup).length,  c:T.acc3 },
+            ].map(x => (
+              <div key={x.l} style={S.card2({textAlign:"center"})}>
+                <div style={{fontFamily:"'DM Serif Display',serif",fontSize:24,color:x.c}}>{x.v}</div>
+                <div style={{fontSize:10,color:T.tx3}}>{x.l}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Przypisz do zbioru */}
+          <div style={S.card2({borderColor:T.acc2})}>
+            <div style={{fontSize:12,color:T.acc2,fontFamily:"'DM Mono',monospace",
+              textTransform:"uppercase",letterSpacing:"1px",marginBottom:8}}>Przypisz do zbioru (opcjonalnie)</div>
+            <select value={assignSet} onChange={e=>setAssignSet(e.target.value)} style={{...S.input(),cursor:"pointer",marginBottom:8}}>
+              <option value="">Bez zbioru</option>
+              {ctx.data.sets.filter(s=>s.status==="active").map(s=>(
+                <option key={s.id} value={s.id}>{s.name}</option>
+              ))}
+              <option value="__new__">+ Utwórz nowy zbiór</option>
+            </select>
+            {assignSet==="__new__" && (
+              <input style={S.input()} value={newSetName} onChange={e=>setNewSetName(e.target.value)}
+                placeholder="Nazwa nowego zbioru…" />
+            )}
+          </div>
+
+          {/* Lista słów */}
+          <div style={S.col(4)}>
+            <div style={S.row({gap:8,padding:"0 4px"})}>
+              <input type="checkbox"
+                checked={selectedIds.length===preview.filter(w=>!w._dup).length&&preview.filter(w=>!w._dup).length>0}
+                onChange={e => {
+                  if (e.target.checked) setSelectedIds(preview.map((_,i)=>i).filter(i=>!preview[i]._dup));
+                  else setSelectedIds([]);
+                }}
+                style={{width:16,height:16,accentColor:T.acc}} />
+              <div style={{fontSize:11,color:T.tx3,fontFamily:"'DM Mono',monospace",textTransform:"uppercase",letterSpacing:"1px"}}>
+                Zaznacz nowe ({selectedIds.length}/{preview.filter(w=>!w._dup).length})
+              </div>
+            </div>
+
+            {preview.map((item,i) => {
+              const isDup = !!item._dup;
+              const sel   = selectedIds.includes(i);
+              const gramMeta = GRAMMAR_TYPES[item.grammarType];
+              const topicMeta = TOPICS[item.topic||"unset"];
+              return (
+                <div key={i}
+                  style={{background:isDup?`${T.acc3}08`:sel?`${T.acc}08`:T.s1,
+                    border:`1px solid ${isDup?T.acc3:sel?T.acc:T.b1}`,
+                    borderRadius:T.r,padding:"10px 12px",
+                    display:"flex",gap:10,alignItems:"flex-start",
+                    opacity:isDup?0.6:1}}>
+                  <input type="checkbox" checked={sel&&!isDup} disabled={isDup}
+                    onChange={()=>!isDup&&toggleSelect(i)}
+                    style={{width:16,height:16,marginTop:2,accentColor:T.acc,flexShrink:0}} />
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{display:"flex",justifyContent:"space-between",gap:8}}>
+                      <span style={{fontFamily:"'DM Mono',monospace",fontWeight:500,fontSize:14}}>{item.en}</span>
+                      {isDup && <span style={S.badge(T.acc3,{fontSize:9})}>duplikat</span>}
+                    </div>
+                    <div style={{fontSize:13,color:T.tx2,marginTop:1}}>{item.pl}</div>
+                    {item.forms && (
+                      <div style={{fontSize:11,color:T.tx3,fontFamily:"'DM Mono',monospace",marginTop:2}}>
+                        {item.forms.past} · {item.forms.pp}
+                      </div>
+                    )}
+                    {item.example_pl && (
+                      <div style={{fontSize:11,color:T.tx3,marginTop:2,fontStyle:"italic"}}>„{item.example_pl}"</div>
+                    )}
+                    <div style={S.row({gap:4,marginTop:5,flexWrap:"wrap"})}>
+                      {gramMeta && <span style={S.badge(gramMeta.color,{fontSize:9})}>{gramMeta.icon} {gramMeta.label}</span>}
+                      {topicMeta&&item.topic!=="unset" && <span style={S.badge(topicMeta.color,{fontSize:9})}>{topicMeta.icon} {topicMeta.label}</span>}
+                    </div>
+                    {isDup && (
+                      <div style={{fontSize:11,color:T.acc3,marginTop:3}}>
+                        {item._dup.type==="exact"?"Identyczne słowo już istnieje":"Podobne słowo:"} „{item._dup.match?.en}"
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {selectedIds.length>0 && (
+            <button style={{...S.btn("primary"),width:"100%",justifyContent:"center",padding:"14px",fontSize:15}}
+              onClick={doImport}>
+              ⬆ Importuj zaznaczone ({selectedIds.length})
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Done */}
+      {status==="done" && (
+        <div style={S.col(16,{alignItems:"center",padding:"40px 0",textAlign:"center"})}>
+          <div style={{fontSize:48}}>✅</div>
+          <div style={{fontSize:18,fontFamily:"'DM Serif Display',serif",color:T.green}}>Import zakończony!</div>
+          <div style={{fontSize:13,color:T.tx2}}>Słowa zostały dodane do bazy.</div>
+          <button style={{...S.btn("primary"),marginTop:8}} onClick={()=>{setStatus("idle");setMode(null);}}>
+            Importuj kolejne
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ════════════════════════════════════════════════════════════
@@ -3053,7 +3745,6 @@ function AddUserModal({ onAdd, onClose }) {
     </Modal>
   );
 }
-
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(React.createElement(App));
